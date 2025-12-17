@@ -212,7 +212,7 @@ def partial_dependence_recency(posterior, data_uci, n_grid=50, n_draws=1000, mod
     # ---- 5.  loop over sampled draws ----
     for m, draw_idx in enumerate(idx):
         point = {k: np.atleast_1d(v[draw_idx]) for k, v in posterior.items()}
-        full  = rebuild_deterministics(model, raw_point=point)  # model not needed
+        full  = rebuild_deterministics(model, raw_point)  # model not needed
         
         for k in range(K):
             eta = full['beta0'][k] + designs[k] @ full['beta_R'][k]  # (n_grid,)

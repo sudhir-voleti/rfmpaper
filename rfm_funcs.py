@@ -170,7 +170,7 @@ def rebuild_deterministics(model, raw_point):
 import numpy as np, pandas as pd
 from patsy import dmatrix
 
-def partial_dependence_recency(posterior, data_uci, n_grid=50, n_draws=1000):
+def partial_dependence_recency(posterior, data_uci, n_grid=50, n_draws=1000, model=None):
     """
     State-specific partial dependence of log-recency on expected weekly spend.
     Holds F & M at sample means.

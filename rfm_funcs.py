@@ -202,9 +202,10 @@ def partial_dependence_recency(posterior, data_uci, n_grid=50, n_draws=1000):
     for k in range(K):
         # dummy frame: same length as grid, recency = r_seq, F=M=mean
         dummy = pd.DataFrame({'R': r_seq, 'F': F_mean, 'M': M_mean})
-        designs[k] = dmatrix("bs(R, knots=5, degree=3, include_intercept=False) + F + M",
-                             data=dummy, return_type='dataframe').values[:, :4]  # drop int
-    
+        knots_r = np.linspace(dummy.R.min(), dummy.R.max(), 5)   # 5 interior knots
+        formula = f"bs(R, knots={knots_r.tolist()}, degree=3, include_intercept=False) + F + M"
+        designs[k] = dmatrix(formula, data=dummy, return_type='dataframe').values[:, :4]  # drop int
+        
     # ---- 4.  allocate results ----
     mu_grid = np.full((n_grid, K, len(idx)), np.nan)
     

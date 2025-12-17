@@ -228,4 +228,62 @@ def partial_dependence_recency(posterior, data_uci, n_grid=50, n_draws=1000, mod
     })
     return out
 
+# ------------------------------------------------------------------
+# Figure 5: ROI menu bar chart (UCI & CDNOW, +5 pp retention lift)
+# ------------------------------------------------------------------
+import pandas as pd, numpy as np, requests, pickle, seaborn as sns, matplotlib.pyplot as plt
+
+def roi_menu_csv(dataset, pkl_path, csv_out, n_draws_wanted=1000, cost_ratio=0.2, lift_pp=5):
+    """
+    Simulate +5 pp Engaged-state retention lift → ROI posterior
+    dataset : str – 'UCI' or 'CDNOW'
+    """
+    # 1. load posterior
+    with open(pkl_path, 'rb') as f:
+        raw = pickle.load(f)
+    post_full = {k: v.reshape(-1, *v.shape[2:]) for k, v in raw['posterior'].items()}
+    thin = max(1, post_full['beta0_raw'].shape[0] // n_draws_wanted)
+    post = {k: v[::thin] for k, v in post_full.items()}
+
+    # 2. load data & model
+    if dataset == 'UCI':
+        df = pd.read_csv('/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/uci_full_panel_regime.csv')
+    else:  # CDNOW
+        df = pd.read_csv('/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/CDNOW/cdnow_subsample_180k.csv')
+    data = build_uci_data(df.CustomerID.unique(), df)
+
+    # 3. allocate
+    K = 3
+    n_draws = post['beta0_raw'].shape[0]
+    clv_ctrl = np.full((K, n_draws), np.nan)
+    clv_treat = np.full((K, n_draws), np.nan)
+
+    with make_model(data, K=K) as model:
+        for i in range(n_draws):
+            point = {k: np.atleast_1d(v[i]) for k, v in post.items()}
+            full = rebuild_deterministics(model, point)
+
+            # baseline 52-week CLV per state
+            base_p = full['trans']  # (K,K)
+            base_mu = full['mu'].mean(axis=0)  # (K,)
+            clv_ctrl[:, i] = base_mu / (1 - base_p.diagonal())  # perpetuity approx
+
+            # treated: +5 pp self-transition
+            treat_p = base_p.copy()
+            treat_p[2, 2] += lift_pp / 100  # Engaged state only
+            treat_p[2, :] /= treat_p[2, :].sum()  # re-normalise row
+            clv_treat[:, i] = base_mu / (1 - treat_p.diagonal())
+
+    # 4. ROI posterior
+    roi_post = (clv_treat - clv_ctrl) / (cost_ratio * clv_ctrl)  # cost = 20 % baseline
+    out = pd.DataFrame({
+        'dataset': dataset,
+        'state': ['Engaged', 'Cooling', 'Churned'],
+        'mean_roi': roi_post.mean(axis=1),
+        'cri_lower': np.percentile(roi_post, 5, axis=1),
+        'cri_upper': np.percentile(roi_post, 95, axis=1)
+    })
+    out.to_csv(csv_out, index=False)
+    print(f'[OK] {csv_out} saved')
+    return out
 

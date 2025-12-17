@@ -166,3 +166,65 @@ def rebuild_deterministics(model, raw_point):
     )
 
     return full_point
+
+import numpy as np, pandas as pd
+from patsy import dmatrix
+
+def partial_dependence_recency(posterior, data_uci, n_grid=50, n_draws=1000):
+    """
+    State-specific partial dependence of log-recency on expected weekly spend.
+    Holds F & M at sample means.
+    
+    posterior : dict  – thinned posterior (already flattened)
+    data_uci  : dict  – output of build_uci_data()
+    n_grid    : int   – number of log-recency evaluation points
+    n_draws   : int   – how many posterior draws to use (randomly sampled)
+    
+    Returns
+    -------
+    pd.DataFrame with columns
+        state, log_recency, mean, cri_lower, cri_upper
+    """
+    K = 3
+    draws_total = posterior['beta0_raw'].shape[0]
+    idx = np.random.choice(draws_total, size=min(n_draws, draws_total), replace=False)
+    
+    # ---- 1.  grid for log-recency (observed range) ----
+    R_obs = np.log(data_uci['y'] + 1)          # quick proxy; replace with real R_cl if avail
+    r_seq = np.linspace(R_obs.min(), R_obs.max(), n_grid)
+    
+    # ---- 2.  helper matrix: hold F & M at means ----
+    F_mean = data_uci['X_F'][:, 0].mean()
+    M_mean = data_uci['X_M'][:, 0].mean()
+    
+    # ---- 3.  build design matrix for each (r, k) ----
+    designs = {}
+    for k in range(K):
+        # dummy frame: same length as grid, recency = r_seq, F=M=mean
+        dummy = pd.DataFrame({'R': r_seq, 'F': F_mean, 'M': M_mean})
+        designs[k] = dmatrix("bs(R, knots=5, degree=3, include_intercept=False) + F + M",
+                             data=dummy, return_type='dataframe').values[:, :4]  # drop int
+    
+    # ---- 4.  allocate results ----
+    mu_grid = np.full((n_grid, K, len(idx)), np.nan)
+    
+    # ---- 5.  loop over sampled draws ----
+    for m, draw_idx in enumerate(idx):
+        point = {k: np.atleast_1d(v[draw_idx]) for k, v in posterior.items()}
+        full  = rebuild_deterministics(model=None, raw_point=point)  # model not needed
+        
+        for k in range(K):
+            eta = full['beta0'][k] + designs[k] @ full['beta_R'][k]  # (n_grid,)
+            mu_grid[:, k, m] = np.exp(eta)
+    
+    # ---- 6.  summarise across draws ----
+    out = pd.DataFrame({
+        'state': np.tile(['Engaged', 'Cooling', 'Churned'], n_grid),
+        'log_recency': np.repeat(r_seq, K),
+        'mean': mu_grid.mean(axis=2).ravel(),
+        'cri_lower': np.percentile(mu_grid, 2.5, axis=2).ravel(),
+        'cri_upper': np.percentile(mu_grid, 97.5, axis=2).ravel()
+    })
+    return out
+
+

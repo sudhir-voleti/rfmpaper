@@ -123,15 +123,76 @@ run_static_benchmarks <- function(rfm_df) {
   do.call(rbind, results)
 }
 
-## Usage example
-'''
-# 1. Ingest
-raw_data <- ingest_cdnow("purchases.csv")
+# --- 5. MANUSCRIPT TABLE BUILDERS ---
 
-# 2. Process
-rfm_panel <- build_rfm_baseline(raw_data)
+#' Table 1: Comparative Summary Statistics
+make_manuscript_table_1 <- function(rfm_uci, rfm_cdnow) {
+  calc_stats <- function(df, label) {
+    df %>%
+      summarise(
+        Dataset = label,
+        `Total Obs (N)` = n(),
+        `Unique Cust`   = n_distinct(customer_id),
+        `Mean Weekly $` = round(mean(WeeklySpend), 2),
+        `Zero-Inflation %` = paste0(round(mean(WeeklySpend == 0) * 100, 1), "%"),
+        `Spend Skewness` = round(moments::skewness(WeeklySpend), 2),
+        `Spend Kurtosis` = round(moments::kurtosis(WeeklySpend), 2)
+      )
+  }
+  bind_rows(calc_stats(rfm_uci, "UCI Retail"), calc_stats(rfm_cdnow, "CDNOW"))
+}
 
-# 3. Horse-Race
-table_3_results <- run_static_benchmarks(rfm_panel)
-print(table_3_results)
-'''
+#' Table 2: Threshold Tipping Point Evidence
+make_manuscript_table_2 <- function(rfm_df) {
+  cust_stats <- rfm_df %>%
+    group_by(customer_id) %>%
+    summarise(p0 = mean(WeeklySpend == 0), .groups = "drop")
+  
+  rfm_df %>%
+    left_join(cust_stats, by = "customer_id") %>%
+    mutate(Regime = case_when(
+      p0 < 0.50  ~ "Low Zero (Active)",
+      p0 < 0.75  ~ "Mid Zero (Intermittent)",
+      TRUE       ~ "High Zero (Clumpy/Tipping)"
+    )) %>%
+    group_by(Regime) %>%
+    summarise(
+      `N Weeks` = n(),
+      `Avg Spend` = round(mean(WeeklySpend), 2),
+      `Pr(Y=0)` = round(mean(WeeklySpend == 0), 3),
+      `Avg Freq` = round(mean(F_rolling), 2)
+    )
+}
+
+# ==============================================================================
+# USAGE EXAMPLES: REPLICATING MANUSCRIPT TABLES
+# ==============================================================================
+#
+# # 1. DATA INGESTION & PREP
+# uci_raw   <- ingest_uci("Online Retail.csv")
+# cdn_raw   <- ingest_cdnow("purchases.csv")
+#
+# uci_panel <- build_rfm_baseline(uci_raw)
+# cdn_panel <- build_rfm_baseline(cdn_raw)
+#
+# # 2. REPLICATE TABLE 1 (Summary Statistics)
+# # Compares raw geometry and clumpiness (skewness/kurtosis)
+# table_1 <- make_manuscript_table_1(uci_panel, cdn_panel)
+# print(table_1)
+#
+# # 3. REPLICATE TABLE 2 (Tipping Point Evidence)
+# # Tests the pi_0 approx 0.75 threshold
+# table_2_cdn <- make_manuscript_table_2(cdn_panel)
+# print(table_2_cdn)
+#
+# # 4. REPLICATE TABLE 3 (Static Horse-Race / Ablation Study)
+# # Compares Poisson GLM vs. Neg-Binomial vs. Tweedie GAM
+# table_3_uci <- run_static_benchmarks(uci_panel)
+# table_3_cdn <- run_static_benchmarks(cdn_panel)
+#
+# print("UCI Results:")
+# print(table_3_uci)
+# print("CDNOW Results:")
+# print(table_3_cdn)
+#
+# ==============================================================================

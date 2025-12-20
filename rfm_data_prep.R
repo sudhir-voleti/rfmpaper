@@ -196,3 +196,89 @@ make_manuscript_table_2 <- function(rfm_df) {
 # print(table_3_cdn)
 #
 # ==============================================================================
+
+library(ggplot2)
+library(patchwork) # For combining plots
+
+# --- 6. MANUSCRIPT VISUALIZATION MODULE ---
+
+#' Figure A: The Stochastic Gap (Distributional Comparison)
+#' Visualizes actual spend vs. Model predictions to show the "Zero-Spike" fit
+plot_stochastic_gap <- function(rfm_df, tweedie_mod) {
+  preds <- predict(tweedie_mod, rfm_df, type = "response")
+  
+  plot_data <- data.frame(
+    Value = c(rfm_df$WeeklySpend, preds),
+    Type = rep(c("Actual Spend", "Tweedie Prediction"), each = nrow(rfm_df))
+  )
+  
+  ggplot(plot_data, aes(x = Value, fill = Type)) +
+    geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+    scale_x_log10(labels = scales::dollar_format()) +
+    theme_minimal() +
+    labs(title = "The Stochastic Gap: Spend Distribution vs. Tweedie Fit",
+         subtitle = "Visualizing zero-inflation and heavy-tail capture",
+         x = "Weekly Spend (Log Scale)", y = "Frequency Count") +
+    scale_fill_manual(values = c("grey30", "firebrick"))
+}
+
+#' Figure B: The Recency Cliff (Non-linear Marginal Effects)
+#' Replicates the visual proof of structural collapse in traditional models
+plot_recency_cliff <- function(tweedie_gam) {
+  # Extract marginal effect of Recency from the GAM
+  plot_df <- plot(tweedie_gam, select = 1, shift = coef(tweedie_gam)[1], 
+                  trans = exp, seWithMean = TRUE, unconditional = TRUE)
+  
+  # We manually rebuild the plot for ggplot aesthetics
+  r_grid <- seq(min(tweedie_gam$model$R_lagged), max(tweedie_gam$model$R_lagged), length.out = 100)
+  pred_data <- data.frame(R_lagged = r_grid, F_rolling = mean(tweedie_gam$model$F_rolling), 
+                          M_rolling = mean(tweedie_gam$model$M_rolling))
+  
+  p_vals <- predict(tweedie_gam, pred_data, type = "link", se.fit = TRUE)
+  pred_data$fit <- exp(p_vals$fit)
+  pred_data$up  <- exp(p_vals$fit + 1.96 * p_vals$se.fit)
+  pred_data$lo  <- exp(p_vals$fit - 1.96 * p_vals$se.fit)
+  
+  ggplot(pred_data, aes(x = R_lagged, y = fit)) +
+    geom_ribbon(aes(ymin = lo, ymax = up), alpha = 0.2, fill = "royalblue") +
+    geom_line(color = "royalblue", size = 1) +
+    theme_minimal() +
+    labs(title = "The Recency Cliff",
+         subtitle = "Non-linear decay of expected spend as a function of Recency",
+         x = "Days Since Last Purchase (R_lagged)", y = "Expected Weekly Spend")
+}
+
+#' Figure C: Regime Variance Diagnostic
+#' Replicates the 'Threshold Tipping Point' visual evidence
+plot_regime_variance <- function(rfm_df) {
+  # Create regimes based on our manuscript threshold (pi_0 = 0.75)
+  cust_p0 <- rfm_df %>% group_by(customer_id) %>% summarise(p0 = mean(WeeklySpend == 0))
+  
+  rfm_df %>%
+    left_join(cust_p0, by = "customer_id") %>%
+    mutate(Regime = if_else(p0 >= 0.75, "High-Zero (Tipping)", "Low-Zero (Active)")) %>%
+    ggplot(aes(x = Regime, y = WeeklySpend + 1, fill = Regime)) +
+    geom_violin(alpha = 0.7) +
+    scale_y_log10() +
+    theme_minimal() +
+    labs(title = "Variance Explosion at the Tipping Point",
+         y = "Spend + 1 (Log Scale)") +
+    guides(fill = "none")
+}
+
+# # 5. REPLICATE MANUSCRIPT FIGURES
+# # Fit the Tweedie GAM first (from our horse-race module)
+# uci_gam <- gam(WeeklySpend ~ s(R_lagged) + s(F_rolling) + s(M_rolling), 
+#                family = Tweedie(p = 1.25, link = "log"), data = uci_panel)
+#
+# # Replicate the Distributional Fit Figure
+# fig_1 <- plot_stochastic_gap(uci_panel, uci_gam)
+# ggsave("figure_1_stochastic_gap.png", fig_1, width = 8, height = 5)
+#
+# # Replicate the Recency Cliff Figure
+# fig_2 <- plot_recency_cliff(uci_gam)
+# ggsave("figure_2_recency_cliff.png", fig_2, width = 8, height = 5)
+#
+# # Replicate the Tipping Point Diagnostic
+# fig_3 <- plot_regime_variance(cdn_panel)
+# ggsave("figure_3_regime_variance.png", fig_3, width = 8, height = 5)

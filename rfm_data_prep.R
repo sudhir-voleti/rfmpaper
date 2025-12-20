@@ -122,3 +122,16 @@ run_static_benchmarks <- function(rfm_df) {
   
   do.call(rbind, results)
 }
+
+## Usage example
+'''
+# 1. Ingest
+raw_data <- ingest_cdnow("purchases.csv")
+
+# 2. Process
+rfm_panel <- build_rfm_baseline(raw_data)
+
+# 3. Horse-Race
+table_3_results <- run_static_benchmarks(rfm_panel)
+print(table_3_results)
+'''

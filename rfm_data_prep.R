@@ -54,7 +54,7 @@ build_rfm_baseline <- function(weekly_df) {
       # Recency: Days since last activity (Known at start of week)
       was_active = lag(n_transactions > 0, default = FALSE),
       last_active = na.locf(if_else(was_active, lag(WeekStart), as.Date(NA)), na.rm = FALSE),
-      R_lagged = as.numeric(difftime(WeekStart, coalesce(last_active, first(WeekStart)), units = "days"))
+      R_lagged = as.numeric(difftime(WeekStart, coalesce(last_active, first(WeekStart)), units = "weeks"))
     ) %>%
     filter(!is.na(F_rolling), !is.na(M_rolling)) %>%
     ungroup()
@@ -420,3 +420,27 @@ plot_spend_surface <- function(rfm_df, title = "Empirical Spend Surface") {
 # dev.off()
 #
 # ==============================================================================
+
+# ==============================================================================
+# MANUSCRIPT REPLICATION SUITE
+# ==============================================================================
+# run_full_replication <- function(uci_path = "Online Retail.csv", cdn_path = "purchases.csv") {
+#   
+#   # 1. Ingest & Process
+#   uci <- build_rfm_baseline(ingest_uci(uci_path))
+#   cdn <- build_rfm_baseline(ingest_cdnow(cdn_path))
+#   
+#   # 2. Generate Tables
+#   print(make_manuscript_table_1(uci, cdn))
+#   print(make_manuscript_table_2(cdn))
+#   
+#   # 3. Generate Static Benchmarks (Table 3)
+#   print(run_static_benchmarks(cdn))
+#   
+#   # 4. Save Figures (The Vertical Stack)
+#   pdf("Figure_4_Surfaces.pdf", width = 8, height = 11)
+#     par(mfrow=c(2,1)) # Stack vertically
+#     plot_spend_surface(uci, title = "UCI Retail Panel")
+#     plot_spend_surface(cdn, title = "CDNOW Marketplace Panel")
+#   dev.off()
+# }

@@ -287,3 +287,36 @@ def roi_menu_csv(dataset, pkl_path, csv_out, n_draws_wanted=1000, cost_ratio=0.2
     print(f'[OK] {csv_out} saved')
     return out
 
+# src/smc_forward.py
+import pathlib, pandas as pd, numpy as np, pymc as pm, time, pickle, os, platform
+
+def smc_forward(df, customer_col='CustomerID', K=3, draws=1000, chains=None, seed=42):
+    """
+    Minimal SMC forward run for lumpy-HMM.
+    Returns pathlib.Path to saved pickle.
+    """
+    # 0. auto-detect cores (M1-safe)
+    cores = chains if chains else min(4, os.cpu_count() or 1)
+    chains = chains or min(4, os.cpu_count() or 1)
+
+    # 1. build data
+    from .smc_model_grok import build_uci_data, make_model
+    data_uci = build_uci_data(df[customer_col].unique(), df)
+
+    # 2. run SMC
+    ROOT = pathlib.Path(os.getenv('LUMPYHMM_RESULTS', './results'))
+    ROOT.mkdir(exist_ok=True)
+    t0 = time.time()
+    with make_model(data_uci, K=K) as model:
+        idata = pm.sample_smc(draws=draws, chains=chains, cores=cores, random_seed=seed, progressbar=True)
+
+        # 3. save only posterior
+        raw_post = {k: v.values for k, v in idata['posterior'].items()}
+        pkl_path = ROOT / f'smc_forward_K{K}_D{draws}_C{chains}.pkl'
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(raw_post, f)
+
+    print(f'SMC K={K} finished in {time.time() - t0:.1f} min – saved to {pkl_path}')
+    return pkl_path
+
+

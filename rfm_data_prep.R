@@ -366,3 +366,57 @@ plot_hmm_transitions <- function(Gamma,
 #                       0.270, 0.274, 0.456), nrow = 3, byrow = TRUE)
 # rownames(Gamma_uci) <- colnames(Gamma_uci) <- c("Engaged", "Cooling", "Churned")
 # plot_hmm_transitions(Gamma_uci, title = "UCI: Latent State Dynamics")
+
+#' Figure E: Empirical Spend Surface (Model-Free Analysis)
+#' Visualizes the interaction between Recency, p0, and Spend
+plot_spend_surface <- function(rfm_df, title = "Empirical Spend Surface") {
+  
+  # 1. Prepare surface: Calculate mean spend per (Recency, p0) cell
+  surf_data <- rfm_df %>%
+    filter(WeeklySpend > 0) %>%
+    group_by(customer_id) %>%
+    mutate(p0_cust = mean(WeeklySpend == 0)) %>%
+    group_by(R_lagged, p0_cust) %>%
+    summarise(M_avg = mean(WeeklySpend, na.rm = TRUE), .groups = "drop")
+  
+  # 2. Bivariate Interpolation
+  surf_interp <- with(surf_data, interp(
+    x = R_lagged, 
+    y = p0_cust, 
+    z = log(M_avg + 1), 
+    duplicate = "mean",
+    xo = seq(min(R_lagged), max(R_lagged), length = 40),
+    yo = seq(min(p0_cust), max(p0_cust), length = 40)
+  ))
+  
+  # 3. Plotting
+  cols <- gray.colors(100, start = 0.9, end = 0.3)
+  
+  image(surf_interp, col = cols, 
+        xlab = "Recency (Weeks)", 
+        ylab = "Zero-Incidence (p0)",
+        main = title)
+  
+  contour(surf_interp, add = TRUE, col = "white", labcex = 0.8)
+  
+  # Tipping Point Reference
+  abline(h = 0.75, col = "firebrick", lty = 2, lwd = 2)
+  text(x = max(rfm_df$R_lagged)*0.75, y = 0.78, "Threshold (p0 = 0.75)", col = "firebrick", font = 2)
+}
+
+# ==============================================================================
+# 5. REPLICATE MANUSCRIPT FIGURES (Continued)
+# ==============================================================================
+#
+# # (C) Topology of Failure (Model-Free Proof)
+# # Replicates the heatmap showing structural collapse above p0 = 0.75
+#
+# pdf("Figure_Topology_CDNOW.pdf", width = 8, height = 6)
+# plot_topology_of_failure(cdn_panel, title = "CDNOW: Topology of Failure")
+# dev.off()
+#
+# pdf("Figure_Topology_UCI.pdf", width = 8, height = 6)
+# plot_topology_of_failure(uci_panel, title = "UCI Retail: Topology of Failure")
+# dev.off()
+#
+# ==============================================================================

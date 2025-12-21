@@ -287,36 +287,111 @@ def roi_menu_csv(dataset, pkl_path, csv_out, n_draws_wanted=1000, cost_ratio=0.2
     print(f'[OK] {csv_out} saved')
     return out
 
-# src/smc_forward.py
-import pathlib, pandas as pd, numpy as np, pymc as pm, time, pickle, os, platform
-
+# ---------- NEW FUNCTIONS (v1.0) ----------
 def smc_forward(df, customer_col='CustomerID', K=3, draws=1000, chains=None, seed=42):
     """
     Minimal SMC forward run for lumpy-HMM.
     Returns pathlib.Path to saved pickle.
     """
-    # 0. auto-detect cores (M1-safe)
+    import pathlib, os, platform
     cores = chains if chains else min(4, os.cpu_count() or 1)
     chains = chains or min(4, os.cpu_count() or 1)
-
-    # 1. build data
     from .smc_model_grok import build_uci_data, make_model
-    data_uci = build_uci_data(df[customer_col].unique(), df)
-
-    # 2. run SMC
     ROOT = pathlib.Path(os.getenv('LUMPYHMM_RESULTS', './results'))
     ROOT.mkdir(exist_ok=True)
+    data_uci = build_uci_data(df[customer_col].unique(), df)
     t0 = time.time()
     with make_model(data_uci, K=K) as model:
         idata = pm.sample_smc(draws=draws, chains=chains, cores=cores, random_seed=seed, progressbar=True)
-
-        # 3. save only posterior
         raw_post = {k: v.values for k, v in idata['posterior'].items()}
         pkl_path = ROOT / f'smc_forward_K{K}_D{draws}_C{chains}.pkl'
         with open(pkl_path, 'wb') as f:
             pickle.dump(raw_post, f)
-
     print(f'SMC K={K} finished in {time.time() - t0:.1f} min – saved to {pkl_path}')
     return pkl_path
 
 
+def smc_post_run(pkl_path, model=None):
+    """
+    Harvest log-evidence, CLV, plots from pickle.
+    Returns dict with results.
+    """
+    import pathlib, pickle, pandas as pd, numpy as np, time
+    from scipy.special import logsumexp
+    from .smc_model_grok import rebuild_deterministics, make_model
+
+    pkl = pathlib.Path(pkl_path)
+    with open(pkl, 'rb') as f:
+        raw = pickle.load(f)
+    post = {k: v for k, v in raw['posterior'].items()}
+    n_samples = post['beta0_raw'].shape[0]
+
+    # evidence from log-weights
+    log_weights = raw['sample_stats']['log_marginal_likelihood']
+    ll_vals = np.array([row[-1] for ch in log_weights for row in ch if len(row) and not np.isnan(row[-1])])
+    log_ev = float(logsumexp(ll_vals) - np.log(len(ll_vals)))
+
+    # CLV per state (mean across draws)
+    mu_mean  = post['mu'].mean(axis=2)   # (N, K)
+    phi_mean = post['phi'].mean(axis=1)  # (K,)
+    retain   = post['trans'].mean(axis=2).diagonal()
+    disc = 0.95
+    clv_state = pd.Series(index=range(3), dtype=float)
+    for k in range(3):
+        spend = mu_mean.mean(axis=0)[k]
+        clv_state[k] = (spend * disc) / (1.0 - disc * retain[k]) if retain[k] < 1.0 else 0.0
+
+    results = {'log_evidence': log_ev, 'clv_per_state': clv_state}
+    print(f'[OK] Post-run finished – log-ev = {log_ev:.5f}')
+    return results
+
+
+def roi_menu_csv(dataset, pkl_path, csv_out, n_draws_wanted=1000, cost_ratio=0.2, lift_pp=5):
+    """
+    Simulate +5 pp Engaged-state retention lift → ROI posterior
+    dataset : str – 'UCI' or 'CDNOW'
+    """
+    import pandas as pd, numpy as np, requests, pickle, seaborn as sns, matplotlib.pyplot as plt
+    from .smc_model_grok import build_uci_data, rebuild_deterministics, make_model
+
+    with open(pkl_path, 'rb') as f:
+        raw = pickle.load(f)
+    post_full = {k: v.reshape(-1, *v.shape[2:]) for k, v in raw['posterior'].items()}
+    thin = max(1, post_full['beta0_raw'].shape[0] // n_draws_wanted)
+    post = {k: v[::thin] for k, v in post_full.items()}
+
+    if dataset == 'UCI':
+        df = pd.read_csv('https://raw.githubusercontent.com/sudhir-voleti/rfmpaper/main/uci_full_panel_regime.csv')
+    else:  # CDNOW
+        df = pd.read_csv('https://raw.githubusercontent.com/sudhir-voleti/rfmpaper/main/cdnow_subsample_180k.csv')
+    data = build_uci_data(df.CustomerID.unique(), df)
+
+    K = 3
+    n_draws = post['beta0_raw'].shape[0]
+    clv_ctrl = np.full((K, n_draws), np.nan)
+    clv_treat = np.full((K, n_draws), np.nan)
+
+    with make_model(data, K=K) as model:
+        for i in range(n_draws):
+            point = {k: np.atleast_1d(v[i]) for k, v in post.items()}
+            full = rebuild_deterministics(model, point)
+            base_p = full['trans']
+            base_mu = full['mu'].mean(axis=0)
+            clv_ctrl[:, i] = base_mu / (1 - base_p.diagonal())
+            treat_p = base_p.copy()
+            treat_p[2, 2] += lift_pp / 100
+            treat_p[2, :] /= treat_p[2, :].sum()
+            clv_treat[:, i] = base_mu / (1 - treat_p.diagonal())
+
+    roi_post = (clv_treat - clv_ctrl) / (cost_ratio * clv_ctrl)
+    out = pd.DataFrame({
+        'dataset': dataset,
+        'state': ['Engaged', 'Cooling', 'Churned'],
+        'mean_roi': roi_post.mean(axis=1),
+        'cri_lower': np.percentile(roi_post, 5, axis=1),
+        'cri_upper': np.percentile(roi_post, 95, axis=1)
+    })
+    out.to_csv(csv_out, index=False)
+    print(f'[OK] {csv_out} saved')
+    return out
+# ---------- END NEW FUNCTIONS ----------

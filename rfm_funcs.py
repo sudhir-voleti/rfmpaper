@@ -287,27 +287,31 @@ def roi_menu_csv(dataset, pkl_path, csv_out, n_draws_wanted=1000, cost_ratio=0.2
     print(f'[OK] {csv_out} saved')
     return out
 
-# ---------- NEW FUNCTIONS (v1.0) ----------
+# ---------- NEW FUNCTIONS (v1.1) ----------
 def smc_forward(df, customer_col='CustomerID', K=3, draws=1000, chains=None, seed=42):
     """
     Minimal SMC forward run for lumpy-HMM.
     Returns pathlib.Path to saved pickle.
     """
-    import pathlib, os, platform
+    import pathlib, os, platform, time, pickle
+    from scipy.special import logsumexp
+    from .smc_model_grok import build_uci_data, make_model
+
     cores = chains if chains else min(4, os.cpu_count() or 1)
     chains = chains or min(4, os.cpu_count() or 1)
-    from .smc_model_grok import build_uci_data, make_model
     ROOT = pathlib.Path(os.getenv('LUMPYHMM_RESULTS', './results'))
     ROOT.mkdir(exist_ok=True)
     data_uci = build_uci_data(df[customer_col].unique(), df)
     t0 = time.time()
     with make_model(data_uci, K=K) as model:
         idata = pm.sample_smc(draws=draws, chains=chains, cores=cores, random_seed=seed, progressbar=True)
-        raw_post = {k: v.values for k, v in idata['posterior'].items()}
+        log_lik = idata.sample_stats['log_marginal_likelihood'].values  # (chains, draws)
+        ll_vals = np.array([row[-1] for ch in log_lik for row in ch if len(row) and not np.isnan(row[-1])])
+        log_ev = float(logsumexp(ll_vals) - np.log(len(ll_vals)))
+        print(f'SMC K={K} finished in {time.time() - t0:.1f} min – log-ev = {log_ev:.5f}')
         pkl_path = ROOT / f'smc_forward_K{K}_D{draws}_C{chains}.pkl'
         with open(pkl_path, 'wb') as f:
-            pickle.dump(raw_post, f)
-    print(f'SMC K={K} finished in {time.time() - t0:.1f} min – saved to {pkl_path}')
+            pickle.dump({g: {k: v.values for k, v in idata[g].data_vars.items()} for g in idata.groups()}, f)
     return pkl_path
 
 
@@ -316,7 +320,7 @@ def smc_post_run(pkl_path, model=None):
     Harvest log-evidence, CLV, plots from pickle.
     Returns dict with results.
     """
-    import pathlib, pickle, pandas as pd, numpy as np, time
+    import pathlib, pickle, numpy as np, time
     from scipy.special import logsumexp
     from .smc_model_grok import rebuild_deterministics, make_model
 
@@ -327,7 +331,7 @@ def smc_post_run(pkl_path, model=None):
     n_samples = post['beta0_raw'].shape[0]
 
     # evidence from log-weights
-    log_weights = raw['sample_stats']['log_marginal_likelihood']
+    log_weights = raw['sample_stats']['log_marginal_likelihood']  # nested list
     ll_vals = np.array([row[-1] for ch in log_weights for row in ch if len(row) and not np.isnan(row[-1])])
     log_ev = float(logsumexp(ll_vals) - np.log(len(ll_vals)))
 

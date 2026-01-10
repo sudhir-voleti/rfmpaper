@@ -19,23 +19,27 @@ suppressPackageStartupMessages(library(tidyverse))
 
 # ---- 1.  UCI online retail -------------------------------------------------
 ingest_uci <- function() {
-  tmp <- tempfile(fileext = ".xlsx")
-  curl::curl_download("https://archive.ics.uci.edu/ml/machine-learning-databases/00352/Online%20Retail.xlsx", tmp)
-  raw <- readxl::read_xlsx(tmp) %>% janitor::clean_names()
+  tmp <- tempfile(fileext = ".csv")
+  curl::curl_download("https://archive.ics.uci.edu/static/public/352/data.csv", tmp)
+
+  raw <- read_csv(tmp, show_col_types = FALSE) %>%   # CSV, not Excel
+    janitor::clean_names()
+
   unlink(tmp)
-  
+
   raw %>%
     mutate(
-      date        = as.Date(lubridate::dmy_hm(invoice_date)),
+      date        = as.Date(lubridate::mdy_hm(invoice_date)),  # US format
       Monetary    = quantity * unit_price,
-      customer_id = as.character(customer_id)
+      customer_id = as.character(customer_id),
+      WeekStart   = lubridate::floor_date(date, "week")
     ) %>%
     filter(!is.na(customer_id), quantity > 0, unit_price > 0,
            !str_detect(invoice_no, "^C")) %>%
-    group_by(customer_id, WeekStart = lubridate::floor_date(date, "week")) %>%
+    group_by(customer_id, WeekStart) %>%
     summarise(WeeklySpend = sum(Monetary), n_transactions = n_distinct(invoice_no),
-              .groups = "drop")
-  return(raw)
+              .groups = "drop") %>%
+    return()
 }
 
 # ---- 2.  CDNOW 1/10 sample -------------------------------------------------

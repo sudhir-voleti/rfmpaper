@@ -16,7 +16,7 @@ library(ggforce)   # For Ellipse geoms
 # --- 1. DATA INGESTION (Raw Files) ---
 
 ingest_uci <- function(path) {
-  read_csv(path) %>%
+  raw <- read_csv(path) %>%
     mutate(
       date = dmy_hm(InvoiceDate), 
       Monetary = Quantity * UnitPrice,
@@ -25,10 +25,11 @@ ingest_uci <- function(path) {
     filter(!is.na(customer_id), Quantity > 0, UnitPrice > 0, !str_detect(InvoiceNo, "^C")) %>%
     group_by(customer_id, WeekStart = floor_date(date, "week")) %>%
     summarise(WeeklySpend = sum(Monetary), n_transactions = n_distinct(InvoiceNo), .groups = "drop")
+  return(raw)
 }
 
 ingest_cdnow <- function(path) {
-  read.csv(path) %>%
+  raw <- read.csv(path) %>%
     mutate(
       date = as_date(date),
       customer_id = as.character(users_id),
@@ -36,6 +37,7 @@ ingest_cdnow <- function(path) {
     ) %>%
     group_by(customer_id, WeekStart) %>%
     summarise(WeeklySpend = sum(amt), n_transactions = n(), .groups = "drop")
+  return(raw)
 }
 
 # --- 2. CORE RFM ENGINE (Lagged Feature Engineering) ---

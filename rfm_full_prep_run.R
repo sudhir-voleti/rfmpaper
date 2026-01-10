@@ -6,39 +6,68 @@
 #  * optional diagnostics plots (interactive only)
 # ---------------------------------------------------------------------------
 
-# ---- 0.  package loader (auto-install missing) ----------------------------
-req_pkg <- c("tidyverse", "lubridate", "readr", "here", "janitor", "mgcv",
-             "ggplot2", "scales", "dplyr", "tidyr", "ggrepel", "ggraph", "tidygraph")
-for (p in req_pkg)
-  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
-suppressPackageStartupMessages(library(tidyverse))
 
-# ---- 1.  ingest ------------------------------------------------------------
-ingest_uci <- function(path) {
-  read_csv(path, show_col_types = FALSE) %>%
+# ---- 1.  UCI online retail -------------------------------------------------
+ingest_uci <- function() {
+  tmp <- tempfile(fileext = ".xlsx")
+  curl::curl_download("https://archive.ics.uci.edu/ml/machine-learning-databases/00352/Online%20Retail.xlsx", tmp)
+  raw <- readxl::read_xlsx(tmp) %>% janitor::clean_names()
+  unlink(tmp)
+  
+  raw %>%
     mutate(
-      date        = lubridate::dmy_hm(InvoiceDate),
-      Monetary    = Quantity * UnitPrice,
-      customer_id = as.character(CustomerID)
+      date        = as.Date(lubridate::dmy_hm(invoice_date)),
+      Monetary    = quantity * unit_price,
+      customer_id = as.character(customer_id)
     ) %>%
-    filter(!is.na(customer_id), Quantity > 0, UnitPrice > 0,
-           !str_detect(InvoiceNo, "^C")) %>%
-    group_by(customer_id, WeekStart = floor_date(date, "week")) %>%
-    summarise(WeeklySpend = sum(Monetary), n_transactions = n_distinct(InvoiceNo),
+    filter(!is.na(customer_id), quantity > 0, unit_price > 0,
+           !str_detect(invoice_no, "^C")) %>%
+    group_by(customer_id, WeekStart = lubridate::floor_date(date, "week")) %>%
+    summarise(WeeklySpend = sum(Monetary), n_transactions = n_distinct(invoice_no),
               .groups = "drop")
+  return(raw)
 }
 
-ingest_cdnow <- function(path) {
-  read_csv(path, show_col_types = FALSE) %>%
+# ---- 2.  CDNOW 1/10 sample -------------------------------------------------
+ingest_cdnow <- function() {
+  tmp_dir <- tempdir()
+  zip_path <- file.path(tmp_dir, "cdnow.zip")
+  curl::curl_download("http://www.brucehardie.com/datasets/CDNOW_sample.zip", zip_path)
+  unzip(zip_path, exdir = tmp_dir)
+  txt_path <- list.files(tmp_dir, pattern = "\\.txt$", full.names = TRUE)[1]  # sample inside
+  raw <- read_delim(txt_path, delim = " ", col_names = c("customer", "date", "dollar"), trim_ws = TRUE)
+  
+  raw %>%
     transmute(
       customer_id = as.character(customer),
-      date        = ymd(date),
+      date        = as.Date(date, format = "%Y%m%d"),
       Monetary    = dollar,
       WeekStart   = floor_date(date, "week")
     ) %>%
     group_by(customer_id, WeekStart) %>%
     summarise(WeeklySpend = sum(Monetary), n_transactions = n(),
               .groups = "drop")
+  return(raw)
+}
+
+
+# ---- 3.  end-to-end wrappers ---------------------------------------------
+build_rfm_uci  <- function() build_rfm_baseline(ingest_uci())
+build_rfm_cdnow<- function() build_rfm_baseline(ingest_cdnow())
+
+# ---- 4.  batch build -------------------------------------------------------
+if (sys.nframe() == 0) {               # Rscript
+  cat("Fetching & building UCI panel...\n")
+  uci_rfm  <- build_rfm_uci()
+  saveRDS(uci_rfm,  "data/uci_rfm.rds")
+  cat("UCI final panel:"); print(glimpse(uci_rfm))
+  
+  cat("Fetching & building CDNOW panel...\n")
+  cdnow_rfm<- build_rfm_cdnow()
+  saveRDS(cdnow_rfm, "data/cdnow_rfm.rds")
+  cat("CDNOW final panel:"); print(glimpse(cdnow_rfm))
+  
+  cat("Panels cached in data/*.rds\n")
 }
 
 # ---- 2.  RFM baseline builder ---------------------------------------------

@@ -6,6 +6,16 @@
 #  * optional diagnostics plots (interactive only)
 # ---------------------------------------------------------------------------
 
+# ---- 0.  auto-install any missing packages ---------------------------------
+req_pkg <- c("tidyverse", "lubridate", "readxl", "curl", "janitor",
+             "ggplot2", "scales", "dplyr", "tidyr", "ggrepel",
+             "ggraph", "tidygraph", "openssl")   # openssl only for SHA if you keep it
+
+for (p in req_pkg)
+  if (!requireNamespace(p, quietly = TRUE))
+    install.packages(p, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages(library(tidyverse))
+
 
 # ---- 1.  UCI online retail -------------------------------------------------
 ingest_uci <- function() {

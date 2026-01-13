@@ -74,17 +74,14 @@ path_cdnow <- "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 202
 # ===== 3.  run UCI ==========================================================
 uci_weekly <- ingest_uci(path_uci)
 uci_feat   <- build_rfm_baseline(uci_weekly)
-saveRDS(uci_feat, "data/uci_modelling.rds")
+saveRDS(uci_feat, "uci_modelling.rds")
 cat("UCI done -> uci_modelling.rds\n")
 
 # ===== 4.  run CDNOW ========================================================
 cdnow_weekly <- ingest_cdnow(path_cdnow)
 cdnow_feat   <- build_rfm_baseline(cdnow_weekly)
-saveRDS(cdnow_feat, "data/cdnow_modelling.rds")
+saveRDS(cdnow_feat, "cdnow_modelling.rds")
 cat("CDNOW done -> cdnow_modelling.rds\n")
-
-
-
 
 
 # ---- 6.  interactive diagnostics (only when sourced in RStudio) -----------

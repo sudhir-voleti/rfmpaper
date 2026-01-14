@@ -7,7 +7,7 @@
 # ---------------------------------------------------------------------------
 
 # ---- 0.  auto-install any missing packages ---------------------------------
-req_pkg <- c("tidyverse", "lubridate", "readxl", "curl", "janitor",
+req_pkg <- c("tidyverse", "lubridate", "readxl", "curl", "janitor", "akima",
              "ggplot2", "scales", "dplyr", "tidyr", "ggrepel", "readr",
              "ggraph", "tidygraph", "openssl")   # openssl only for SHA if you keep it
 
@@ -196,32 +196,3 @@ plot_spend_surface <- function(rfm_df, title = "Empirical Spend Surface"){
 plot_spend_surface(uci_rfm,  "UCI Empirical Spend Surface")
 plot_spend_surface(cdnow_rfm, "CDNOW Empirical Spend Surface")
 
-
-
-# ===== 2.  point to your local files ========================================
-#path_uci <- "https://archive.ics.uci.edu/static/public/352/data.csv"
-#path_cdnow <- "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/CDNOW/cdnow_raw_10pct.csv"               # <-- drop your cleaned CDNOW csv here
-
-# ===== 3.  run UCI ==========================================================
-uci_weekly <- ingest_uci(path_uci)
-uci_feat   <- build_rfm_baseline(uci_weekly)
-saveRDS(uci_feat, "uci_modelling.rds")
-cat("UCI done -> uci_modelling.rds\n")
-
-# ===== 4.  run CDNOW ========================================================
-cdnow_weekly <- ingest_cdnow(path_cdnow)
-cdnow_feat   <- build_rfm_baseline(cdnow_weekly)
-saveRDS(cdnow_feat, "cdnow_modelling.rds")
-cat("CDNOW done -> cdnow_modelling.rds\n")
-
-
-# ---- 6.  interactive diagnostics (only when sourced in RStudio) -----------
-if (interactive()) {
-  print("Generating diagnostic plots...")
-  plot_spend_surface(uci_rfm,  "UCI")
-  plot_spend_surface(cdnow_rfm,"CDNOW")
-
-  # (gamma_mat needs your HMM posterior – stub now, fill after SMC)
-  # gamma_uci <- matrix(c(...), nrow = 3, ncol = 3)   # posterior mean
-  # plot_trans_mat(gamma_uci, "UCI")
-}

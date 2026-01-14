@@ -141,6 +141,60 @@ make_table2 <- function(df, set_name) {
 system.time({ table2 <- bind_rows(make_table2(uci, "UCI"), make_table2(cdnow, "CDNOW")) }) # 0.0004 s
 as.data.frame(table2)
 
+## ========== Figure 2 - model free evidence of clumpiness ============
+library(akima)
+
+plot_spend_surface <- function(rfm_df, title = "Empirical Spend Surface"){
+  surf_data <- rfm_df %>%
+    filter(WeeklySpend > 0) %>%
+    group_by(R_weeks, p0_cust) %>%
+    summarise(M_avg = mean(WeeklySpend, na.rm = TRUE), .groups = "drop")
+  
+  surf_interp <- with(surf_data, interp(
+    x = R_weeks, y = p0_cust, z = log(M_avg + 1),
+    duplicate = "mean", linear = TRUE,
+    xo = seq(min(R_weeks), max(R_weeks), length = 50),
+    yo = seq(min(p0_cust), max(p0_cust), length = 50)
+  ))
+  
+  # 1. PREVIEW in RStudio pane
+  par(mar = c(3, 3, 2, 1))
+  cols <- gray.colors(100, start = 0.9, end = 0.3)
+  image(surf_interp, col = cols,
+        xlab = "Recency (Weeks since last purchase)", 
+        ylab = "Zero-Incidence Probability (p0)",
+        main = title)
+  contour(surf_interp, add = TRUE, col = "white", labcex = 0.9, lwd = 0.8)
+  
+  # CORRECT upper-triangle: bottom-left → top-right
+  polygon(x = c(min(surf_interp$x), max(surf_interp$x), max(surf_interp$x)),
+          y = c(min(surf_interp$y), min(surf_interp$y), max(surf_interp$y)),
+          col = "white", border = NA)
+  
+  abline(h = 0.75, col = "firebrick", lty = 2, lwd = 2)
+  text(x = max(rfm_df$R_weeks)*0.7, y = 0.78, "Threshold (p0 = 0.75)", col = "firebrick", font = 2)
+  
+  # 2. HARD COPY to PNG
+  png("outputs/fig1a_uci_surface.png", width = 10, height = 7, units = "in", res = 150)
+  par(mar = c(3, 3, 2, 1))
+  image(surf_interp, col = cols,
+        xlab = "Recency (Weeks since last purchase)", 
+        ylab = "Zero-Incidence Probability (p0)",
+        main = title)
+  contour(surf_interp, add = TRUE, col = "white", labcex = 0.9, lwd = 0.8)
+  polygon(x = c(min(surf_interp$x), max(surf_interp$x), max(surf_interp$x)),
+          y = c(min(surf_interp$y), min(surf_interp$y), max(surf_interp$y)),
+          col = "white", border = NA)
+  abline(h = 0.75, col = "firebrick", lty = 2, lwd = 2)
+  text(x = max(rfm_df$R_weeks)*0.7, y = 0.78, "Threshold (p0 = 0.75)", col = "firebrick", font = 2)
+  dev.off()
+  
+  message("Preview shown + PNG saved: outputs/fig1a_uci_surface.png")
+}
+
+# ---- run --------------------------------------------------------------------
+plot_spend_surface(uci_rfm,  "UCI Empirical Spend Surface")
+plot_spend_surface(cdnow_rfm, "CDNOW Empirical Spend Surface")
 
 
 

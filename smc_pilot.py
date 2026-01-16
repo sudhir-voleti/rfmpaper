@@ -153,17 +153,42 @@ if __name__ == "__main__":
 
 # smc_pilot.py  (bottom)
 def post_run(idata, res):
-    """
-    Generate Tables 4-8 from saved InferenceData + metrics dict.
-    Returns dict of DataFrames ready for LaTeX.
-    """
+    #    with open(pkl_path, 'rb') as f:
+    #    bundle = pickle.load(f)
+
+    #idata = bundle['idata']   # already InferenceData
+    #res   = bundle['res']
+
+    # ---- Table 4: model selection ----
     tbl4 = pd.DataFrame({'K': res['K'], 'log_evidence': res['log_evidence']}, index=[0])
-    tbl5 = az.summary(idata.posterior['Gamma'], hdi_prob=0.95)
+
+    # ---- Table 5: transition matrix + CIs ----
+    gamma = idata.posterior['Gamma']
+    tbl5  = az.summary(gamma, hdi_prob=0.95)  # native MultiIndex
+
+    # ---- Table 6: coefficients + CIs ----
     tbl6 = az.summary(idata, var_names=['beta0','phi'], hdi_prob=0.95)
-    tbl7 = dict(log_pi0  = idata.posterior['pi0'].mean(dim=('chain','draw')).values,
-                log_Gamma= idata.posterior['Gamma'].mean(dim=('chain','draw')).values)
-    tbl8 = idata.posterior['betaR'].mean(dim=('chain','draw'))  # GAM slopes
+
+    # ---- Table 7: Viterbi-ready objects ----
+    tbl7 = {
+        'log_pi0'   : idata.posterior['pi0'].mean(dim=('chain','draw')).values,
+        'log_Gamma' : idata.posterior['Gamma'].mean(dim=('chain','draw')).values,
+    }
+
+    # ---- Table 8: GAM smooth (recency slope) ----
+    tbl8 = idata.posterior['betaR'].mean(dim=('chain','draw'))  # slope per state
+
     return {'tbl4': tbl4, 'tbl5': tbl5, 'tbl6': tbl6, 'tbl7': tbl7, 'tbl8': tbl8}
+
+# ---- reviewer one-liner ----
+if __name__ == "__main__":
+    pkl = pathlib.Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results/full/uci/smc_full_50cust_K3_D1000_C4.pkl")
+    tables = post_run(pkl)
+    print("=== Table 4 ==="); print(tables['tbl4'].round(3))
+    print("=== Table 5 ==="); print(tables['tbl5'].round(3))
+    print("=== Table 6 ==="); print(tables['tbl6'].round(3))
+    print("=== Table 7 ==="); print(tables['tbl7'])
+    print("=== Table 8 ==="); print(tables['tbl8'].round(3))
 
 # ==== Table 4 from saved .pkls ======
 import pathlib, pickle, pandas as pd, numpy as np

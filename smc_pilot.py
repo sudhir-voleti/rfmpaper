@@ -164,3 +164,21 @@ def post_run(idata, res):
                 log_Gamma= idata.posterior['Gamma'].mean(dim=('chain','draw')).values)
     tbl8 = idata.posterior['betaR'].mean(dim=('chain','draw'))  # GAM slopes
     return {'tbl4': tbl4, 'tbl5': tbl5, 'tbl6': tbl6, 'tbl7': tbl7, 'tbl8': tbl8}
+
+# ==== Table 4 from saved .pkls ======
+import pathlib, pickle, pandas as pd, numpy as np
+
+root = pathlib.Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results/full")
+
+tbl4 = []
+for ds in ['uci', 'cdnow']:
+    for k in [2, 3, 4]:
+        pkl = root / ds / f"smc_full_50cust_K{k}_D2000_C4.pkl"
+        with open(pkl, 'rb') as f:
+            bundle = pickle.load(f)
+        tbl4.append({'dataset': ds, 'K': k, 'log_evidence': bundle['res']['log_evidence']})
+
+df_tbl4 = pd.DataFrame(tbl4)
+print("\nTable 4 (pilot)")
+print(df_tbl4.round(3))
+

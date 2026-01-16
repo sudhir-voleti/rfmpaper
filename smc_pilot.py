@@ -149,3 +149,18 @@ if __name__ == "__main__":
     df_tbl = pd.DataFrame(results).set_index('K')
     print("\nTable-4 summary")
     print(df_tbl[['log_evidence']].round(3))
+
+
+# smc_pilot.py  (bottom)
+def post_run(idata, res):
+    """
+    Generate Tables 4-8 from saved InferenceData + metrics dict.
+    Returns dict of DataFrames ready for LaTeX.
+    """
+    tbl4 = pd.DataFrame({'K': res['K'], 'log_evidence': res['log_evidence']}, index=[0])
+    tbl5 = az.summary(idata.posterior['Gamma'], hdi_prob=0.95)
+    tbl6 = az.summary(idata, var_names=['beta0','phi'], hdi_prob=0.95)
+    tbl7 = dict(log_pi0  = idata.posterior['pi0'].mean(dim=('chain','draw')).values,
+                log_Gamma= idata.posterior['Gamma'].mean(dim=('chain','draw')).values)
+    tbl8 = idata.posterior['betaR'].mean(dim=('chain','draw'))  # GAM slopes
+    return {'tbl4': tbl4, 'tbl5': tbl5, 'tbl6': tbl6, 'tbl7': tbl7, 'tbl8': tbl8}

@@ -399,3 +399,295 @@ def roi_menu_csv(dataset, pkl_path, csv_out, n_draws_wanted=1000, cost_ratio=0.2
     print(f'[OK] {csv_out} saved')
     return out
 # ---------- END NEW FUNCTIONS ----------
+## 26 Jan 26 funcs
+
+# rfmfuncs.py  (append below your existing helpers)
+
+from __future__ import annotations
+import pathlib
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import arviz as az
+
+# ----------  TABLE 5  ---------------------------------------------------------
+def make_table5(
+    idata: az.InferenceData,
+    ds_name: str,
+    out_dir: pathlib.Path | None = None,
+    save_plot: bool = True,
+) -> pd.DataFrame:
+    """
+    Posterior-mean transition matrix Γ with optional heat-map.
+
+    Parameters
+    ----------
+    idata   : arviz.InferenceData  (must contain posterior['Gamma'])
+    ds_name : 'uci' or 'cdnow'
+    out_dir : folder for CSV/PDF; None → return DataFrame only
+    save_plot : write PDF heat-map?
+
+    Returns
+    -------
+    DataFrame with columns ['From', 'State0', 'State1', ..., 'StateK-1']
+    """
+    gamma = idata.posterior["Gamma"].mean(("chain", "draw")).values  # (K, K)
+    k = gamma.shape[0]
+    labs = [f"State {i}" for i in range(k)]
+    df = pd.DataFrame(gamma, index=labs, columns=labs)
+    df.insert(0, "From", labs)
+
+    if out_dir is not None:
+        out_dir = pathlib.Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_dir / f"table5_{ds_name}.csv", index=False)
+        if save_plot:
+            plt.figure(figsize=(4, 3))
+            sns.heatmap(
+                df.set_index("From"),
+                annot=True,
+                fmt=".3f",
+                cmap="Blues",
+                cbar_kws={"label": "P(t+1|t)"},
+            )
+            plt.title(f"{ds_name.upper()} – transition matrix")
+            plt.tight_layout()
+            plt.savefig(out_dir / f"gamma_{ds_name}.pdf")
+            plt.close()
+    return df
+
+
+# ----------  TABLE 6  ---------------------------------------------------------
+def make_table6(
+    idata: az.InferenceData,
+    ds_name: str,
+    out_dir: pathlib.Path | None = None,
+) -> pd.DataFrame:
+    """
+    Posterior summary (mean, sd, 95 % HDI) for state-specific β0 and φ.
+
+    Parameters
+    ----------
+    idata   : arviz.InferenceData
+    ds_name : 'uci' or 'cdnow'
+    out_dir : folder for CSV; None → return DataFrame only
+
+    Returns
+    -------
+    DataFrame with columns ['Dataset', 'parameter', 'mean', 'sd', 'hdi_2.5%', 'hdi_97.5%', ...]
+    """
+    summ = az.summary(idata, var_names=["beta0", "phi"], hdi_prob=0.95)
+    summ.insert(0, "Dataset", ds_name.upper())
+
+    if out_dir is not None:
+        out_dir = pathlib.Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        summ.to_csv(out_dir / f"table6_{ds_name}.csv", index=False)
+    return summ
+
+# rfmfuncs.py  (append below existing helpers)
+
+from __future__ import annotations
+import pathlib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.special import gammaln
+
+def make_table7(
+    idata: az.InferenceData,
+    ds_name: str,
+    csv_path: str | pathlib.Path,
+    out_dir: pathlib.Path | None = None,
+    labels: list[str] | None = None,
+    preview_rows: int = 10,
+) -> pd.DataFrame:
+    """
+    Viterbi decoding → state-share over calendar weeks + area plot.
+
+    Parameters
+    ----------
+    idata   : arviz.InferenceData (posterior group)
+    ds_name : 'uci' or 'cdnow'
+    csv_path: original full CSV (to rebuild R,F,M,y,mask)
+    out_dir : folder for CSV/PDF; None → return DataFrame only
+    labels  : state names (length must equal K); None → auto State0…K-1
+    preview_rows : how many weeks to print in Jupyter
+
+    Returns
+    -------
+    DataFrame (week, prop_state0, …, prop_stateK-1) with **all K states** (missing = 0 %)
+    """
+    # posterior-mean parameters → NumPy
+    beta0 = np.asarray(idata.posterior["beta0"].mean(("chain", "draw")).values, dtype=np.float64)
+    betaR = np.asarray(idata.posterior["betaR"].mean(("chain", "draw")).values, dtype=np.float64)
+    betaF = np.asarray(idata.posterior["betaF"].mean(("chain", "draw")).values, dtype=np.float64)
+    betaM = np.asarray(idata.posterior["betaM"].mean(("chain", "draw")).values, dtype=np.float64)
+    phi   = np.asarray(idata.posterior["phi"].mean(("chain", "draw")).values, dtype=np.float64)
+    K = beta0.size
+
+    # reload covariates & spend
+    df  = pd.read_csv(csv_path)
+    cust = df["customer_id"].unique()[:idata.posterior.dims["customer"]]
+    R   = df.pivot(index="customer_id", columns="WeekStart", values="R_weeks").loc[cust].values
+    F   = df.pivot(index="customer_id", columns="WeekStart", values="F_run").loc[cust].values
+    M   = df.pivot(index="customer_id", columns="WeekStart", values="M_run").loc[cust].values
+    y   = df.pivot(index="customer_id", columns="WeekStart", values="WeeklySpend").loc[cust].values
+    mask = ~np.isnan(y)
+
+    # rebuild mu
+    lin = beta0 + betaR * R[..., None] + betaF * F[..., None] + betaM * M[..., None]
+    mu  = np.clip(np.exp(lin), 1e-3, 1e6)
+
+    # Viterbi decode (pure NumPy)
+    pi0   = np.asarray(idata.posterior["pi0"].mean(("chain", "draw")).values, dtype=np.float64)
+    Gamma = np.asarray(idata.posterior["Gamma"].mean(("chain", "draw")).values, dtype=np.float64)
+
+    def zig_logp(y_row, mu_row, phi):
+        psi = np.exp(-mu_row / phi)
+        log_zero = np.log(psi + 1e-12)
+        alpha = mu_row / phi
+        beta  = 1.0 / phi
+        log_pos  = (np.log1p(-psi + 1e-12) +
+                    (alpha - 1) * np.log(y_row[:, None] + 1e-12) -
+                    y_row[:, None] * beta +
+                    alpha * np.log(beta) -
+                    gammaln(alpha))
+        return np.where(y_row[:, None] == 0, log_zero, log_pos)
+
+    def viterbi_numpy(y, mu, phi, pi0, Gamma):
+        N, T, K = mu.shape
+        z = np.empty((N, T), dtype=int)
+        for i in range(N):
+            log_ems = zig_logp(y[i], mu[i], phi)
+            log_delta = np.log(pi0 + 1e-12) + log_ems[0]
+            log_psi = np.zeros((T, K))
+            for t in range(1, T):
+                tmp = log_delta + np.log(Gamma + 1e-12)
+                log_delta = tmp.max(axis=0) + log_ems[t]
+                log_psi[t] = tmp.argmax(axis=0)
+            z_row = np.empty(T, dtype=int)
+            z_row[-1] = log_delta.argmax()
+            for t in range(T - 2, -1, -1):
+                z_row[t] = log_psi[t + 1, z_row[t + 1]]
+            z[i] = z_row
+        return z
+
+    z_mat = viterbi_numpy(y, mu, phi, pi0, Gamma)
+
+    # state share (pad missing states to 0 %)
+    T = mu.shape[1]
+    prop = pd.DataFrame({t: pd.Series(z_mat[:, t]).value_counts(normalize=True) for t in range(T)}).T.fillna(0.0)
+    all_states = np.arange(K)
+    prop = prop.reindex(columns=all_states, fill_value=0.0)  # ensure K columns
+    if labels:
+        if len(labels) != K:
+            raise ValueError(f"labels length {len(labels)} != number of states {K}")
+        prop.columns = labels[:K]
+    else:
+        prop.columns = [f"State {k}" for k in range(K)]
+
+    # area plot
+    if out_dir:
+        out_dir = pathlib.Path(out_dir)
+        out_dir.mkdir(exist_ok=True)
+        prop.to_csv(out_dir / f"table7_{ds_name}.csv", index_label="Week")
+        plt.figure(figsize=(8, 3))
+        prop.plot.area(stacked=True, cmap="coolwarm")
+        plt.title(f"{ds_name.upper()} – latent state share (Viterbi)")
+        plt.ylabel("Proportion")
+        plt.xlabel("Week")
+        plt.legend(title="State", bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"state_share_{ds_name}.pdf")
+        plt.close()
+
+    # Jupyter preview
+    if preview_rows:
+        from IPython.display import display
+        display(prop.head(preview_rows))
+    return prop
+    
+
+# rfmfuncs.py  (append below existing helpers)
+
+from __future__ import annotations
+import pathlib, pandas as pd, arviz as az
+
+def make_table8(
+    idata: az.InferenceData,
+    ds_name: str,
+    out_dir: pathlib.Path | None = None,
+) -> pd.DataFrame:
+    """
+    PSIS-LOO & WAIC summary (Table 8).
+
+    Parameters
+    ----------
+    idata   : arviz.InferenceData (must contain log_likelihood group)
+    ds_name : 'uci' or 'cdnow'
+    out_dir : folder for CSV; None → return DataFrame only
+
+    Returns
+    -------
+    DataFrame with columns ['Dataset', 'ELPD-LOO', 'p_loo', 'SE-LOO', 'WAIC', 'SE-WAIC']
+    """
+    loo  = az.loo(idata, pointwise=True)
+    waic = az.waic(idata, pointwise=True)
+
+    df = pd.DataFrame({
+        "Dataset"  : [ds_name.upper()],
+        "ELPD-LOO" : [loo.elpd_loo],
+        "p_loo"    : [loo.p_loo],
+        "SE-LOO"   : [loo.se],
+        "WAIC"     : [waic.elpd_waic],   # correct attribute
+        "SE-WAIC"  : [waic.se],
+    })
+
+    if out_dir is not None:
+        out_dir = pathlib.Path(out_dir)
+        out_dir.mkdir(exist_ok=True)
+        df.to_csv(out_dir / f"table8_{ds_name}.csv", index=False)
+    return df
+
+'''
+## test drive and run
+ROOT = pathlib.Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results/full")
+PKL_uci  = ROOT / "uci" / "smc_full_4338cust_K5_D1500_C4.pkl"   # start with CDNOW-K4
+PKL_cdnow  = ROOT / "cdnow" / "smc_full_2357cust_K4_D1000_C4.pkl"   # start with CDNOW-K4
+OUT  = ROOT / "paper_step"
+OUT.mkdir(exist_ok=True)
+
+# %% 4.  run -------------------------------------------------------------------
+idata_uci = load_idata(PKL_uci)
+idata_cdnow = load_idata(PKL_cdnow)
+
+tbl5_uci = make_table5(idata_uci, 'uci', out_dir=OUT, preview=True)
+tbl5_cdnow = make_table5(idata_cdnow, 'cdnow', out_dir=OUT, preview=True)
+
+## test-drive
+tbl6_uci = make_table6(idata_uci, "uci")
+tbl6_cdnow = make_table6(idata_cdnow, "cdnow")
+
+csv_uci = "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/data/uci_full.csv"
+csv_cdnow = "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/data/cdnow_full.csv"
+
+tbl7_uci = make_table7(idata_uci, "uci", csv_uci, out_dir=OUT,
+                       labels=['Cold','Cool','Warm','Luke','Hot'],
+                       preview_rows=10, n_cust=None)   # ← decode ALL customers
+
+tbl7_cdnow = make_table7(idata_cdnow, "cdnow", csv_cdnow, out_dir=OUT, labels=["Cold","Cool","Warm","Hot"], 
+                         preview_rows=10, n_cust=None)
+
+# down-sample posterior to every 5th draw (300 instead of 1500)
+idata_uci1 = idata_uci.isel(draw=slice(None, None, 5))
+idata_cdnow1 = idata_cdnow.isel(draw=slice(None, None, 5))
+
+idata_uci1 = add_log_likelihood(idata_uci1, csv_path=csv_uci)
+idata_cdnow1 = add_log_likelihood(idata_cdnow1, csv_path=csv_cdnow)
+
+tbl8_uci = make_table8(idata_uci1, 'uci', out_dir=OUT, preview=True)
+tbl8_cdnow = make_table8(idata_cdnow1, 'cdnow', out_dir=OUT, preview=True)
+'''
+

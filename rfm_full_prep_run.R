@@ -147,6 +147,16 @@ as.data.frame(table2)
 library(akima)
 
 plot_spend_surface <- function(rfm_df, title = "Empirical Spend Surface"){
+
+  # Aggregating to the RFM-cell level to create the surface data
+  rfm_df <- rfm_df %>%
+  group_by(R_weeks, F_run) %>%
+  summarise(
+    p0_cust = mean(zero_incidence_run, na.rm = TRUE),
+    avg_spend = mean(WeeklySpend, na.rm = TRUE),
+    .groups = "drop"
+  ) 
+  
   surf_data <- rfm_df %>%
     filter(WeeklySpend > 0) %>%
     group_by(R_weeks, p0_cust) %>%

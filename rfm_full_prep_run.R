@@ -16,6 +16,8 @@ for (p in req_pkg)
     install.packages(p, repos = "https://cloud.r-project.org")
 suppressPackageStartupMessages(library(tidyverse))
 
+print("reqd pkgs loaded")
+
 # ---- 1.  UCI online retail -------------------------------------------------
 ingest_uci <- function() {
   tmp  <- tempfile(fileext = ".csv")

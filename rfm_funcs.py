@@ -651,6 +651,97 @@ def make_table8(
         df.to_csv(out_dir / f"table8_{ds_name}.csv", index=False)
     return df
 
+def make_table9(
+    idata: az.InferenceData,
+    ds_name: str,
+    out_dir: pathlib.Path | None = None,
+    cost_ratio: float = 0.2,
+    lift_pp: float = 0.05,
+    weeks: int = 52,
+    n_sim: int = 1000,
+    labels: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Counter-factual ROI menu (Table 9): +lift_pp persistence in Hot state, cost = cost_ratio × baseline CLV.
+
+    Parameters
+    ----------
+    idata      : arviz.InferenceData
+    ds_name    : 'uci' or 'cdnow'
+    out_dir    : folder for CSV/PDF; None → return DataFrame only
+    cost_ratio : campaign cost as fraction of baseline CLV
+    lift_pp    : pp increase in Hot→Hot retention
+    weeks      : planning horizon
+    n_sim      : Monte-Carlo samples
+    labels     : state names (length must equal K)
+
+    Returns
+    -------
+    DataFrame with columns ['Dataset', 'Initial State', 'Mean ROI %', '90 % CI']
+    """
+    post = idata.posterior
+    Gamma = post["Gamma"].values                               # (chain, draw, K, K)
+    beta0 = post["beta0"].values                               # (chain, draw, K)
+    phi   = post["phi"].values                                 # (chain, draw, K)
+    K = beta0.shape[-1]
+    hot_idx = K - 1
+    state_labs = labels[hot_idx] if labels else f"State {hot_idx}"
+
+    # down-sample to n_sim (every nth draw)
+    step = max(1, len(Gamma) * len(Gamma[0]) // n_sim)
+    idx = np.arange(0, len(Gamma) * len(Gamma[0]), step)[:n_sim]
+    draws = np.unravel_index(idx, (len(Gamma), len(Gamma[0])))
+    gamma_s = Gamma[draws[0], draws[1]]
+    beta0_s = beta0[draws[0], draws[1]]
+    phi_s   = phi[draws[0], draws[1]]
+
+    # intervention
+    gamma_lift = gamma_s.copy()
+    gamma_lift[:, hot_idx, hot_idx] += lift_pp
+    gamma_lift[:, hot_idx] /= gamma_lift[:, hot_idx].sum(axis=1, keepdims=True)
+
+    # Monte-Carlo simulation
+    roi_samples = []
+    for g, b, p in zip(gamma_lift, beta0_s, phi_s):
+        spend_c = 0.0
+        spend_t = 0.0
+        for init_s in range(K):
+            s_c, s_t = init_s, init_s
+            for w in range(weeks):
+                spend_c += np.exp(b[s_c])
+                spend_t += np.exp(b[s_t])
+                s_c = np.random.choice(K, p=g[s_c])
+                s_t = np.random.choice(K, p=g[s_t])
+        roi = (spend_t - spend_c) / (cost_ratio * spend_c)
+        roi_samples.append(roi)
+
+    df = pd.DataFrame({
+        "Dataset"      : [ds_name.upper()],
+        "Initial State": state_labs,
+        "Mean ROI %"   : np.mean(roi_samples) * 100,
+        "90 % CI"      : f"[{np.percentile(roi_samples, 5)*100:.1f}, {np.percentile(roi_samples, 95)*100:.1f}]",
+    })
+
+    if out_dir is not None:
+        out_dir = pathlib.Path(out_dir)
+        out_dir.mkdir(exist_ok=True)
+        df.to_csv(out_dir / f"table9_{ds_name}.csv", index=False)
+
+        # bar chart with CI
+        plt.figure(figsize=(4, 3))
+        sns.barplot(x=["Hot"], y=[df["Mean ROI %"].iloc[0]], color="steelblue", ci=None)
+        plt.errorbar(0, df["Mean ROI %"].iloc[0],
+                     yerr=[[df["Mean ROI %"].iloc[0] - float(df["90 % CI"].iloc[0].split(",")[0][1:])],
+                           [float(df["90 % CI"].iloc[0].split(",")[1][:-1]) - df["Mean ROI %"].iloc[0]]],
+                     fmt="none", c="black", capsize=5)
+        plt.title(f"{ds_name.upper()} – ROI menu")
+        plt.ylabel("ROI %")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"roi_menu_{ds_name}.pdf")
+        plt.close()
+    return df
+
+
 '''
 ## test drive and run
 ROOT = pathlib.Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results/full")
@@ -689,5 +780,10 @@ idata_cdnow1 = add_log_likelihood(idata_cdnow1, csv_path=csv_cdnow)
 
 tbl8_uci = make_table8(idata_uci1, 'uci', out_dir=OUT, preview=True)
 tbl8_cdnow = make_table8(idata_cdnow1, 'cdnow', out_dir=OUT, preview=True)
+
+tbl9_uci = make_table9(idata_uci, 'uci', out_dir=OUT,
+                       labels=['Cold','Cool','Warm','Luke','Hot'])
+tbl9_cdnow = make_table9(idata_cdnow, 'cdnow', out_dir=OUT,
+                         labels=['Cold','Cool','Warm','Hot'])
 '''
 

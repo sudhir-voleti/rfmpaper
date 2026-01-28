@@ -146,6 +146,15 @@ as.data.frame(table2)
 ## ========== Figure 2 - model free evidence of clumpiness ============
 library(akima)
 
+uci_rfm <- uci_rfm %>% group_by(R_weeks, F_run) %>% mutate(
+      p0_cust = mean(zero_incidence_run, na.rm = TRUE)
+    ) %>% ungroup()
+
+cdnow_rfm <- cdnow_rfm %>% group_by(R_weeks, F_run) %>% mutate(
+      p0_cust = mean(zero_incidence_run, na.rm = TRUE)
+    ) %>% ungroup()
+
+
 plot_spend_surface <- function(rfm_df, title = "Empirical Spend Surface"){
 
   # Aggregating to the RFM-cell level to create the surface data

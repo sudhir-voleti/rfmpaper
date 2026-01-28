@@ -7,6 +7,166 @@ import pymc as pm
 import pytensor.tensor as pt
 from tqdm import tqdm
 
+# rfm_pyfuncs.py  (upgrade snapshot)
+import pathlib, pickle, pandas as pd, numpy as np, xarray as xr, arviz as az
+import pymc as pm, pytensor.tensor as pt
+from scipy.special import logsumexp, gammaln
+import pytensor
+pytensor.config.floatX = 'float32'          # M1 speed
+
+# ------------------------------------------------------------------
+# 1.  DATA  (one-liner rectangular panel)
+# ------------------------------------------------------------------
+def build_panel(csv_path, cust="customer_id", date="WeekStart"):
+    """Return dict ready for model constructors."""
+    df = pd.read_csv(csv_path, parse_dates=[date])
+    assert df.groupby(cust).size().nunique() == 1, "unbalanced panel"
+    mat = lambda c: df.pivot(index=cust, columns=date, values=c).values
+    return dict(N=df[cust].nunique(),
+                T=df.groupby(cust).size().iloc[0],
+                y=mat("WeeklySpend"),
+                mask=~np.isnan(mat("WeeklySpend")),
+                R=mat("R_weeks"), F=mat("F_run"), M=mat("M_run"))
+
+# ------------------------------------------------------------------
+# 2.  STATIC  TWEEDIE-GAM  +  LOO/WAIC
+# ------------------------------------------------------------------
+def static_tweedie_gam_loo(csv_path, draws=1000, chains=4, seed=42):
+    """Return az.InferenceData with log_likelihood group."""
+    data = build_panel(csv_path)
+    with pm.Model() as m:
+        β0 = pm.Normal("β0", 0, 3)
+        βR = pm.Normal("βR", 0, 1)
+        βF = pm.Normal("βF", 0, 1)
+        βM = pm.Normal("βM", 0, 1)
+        phi = pm.Exponential("phi", 1.0)
+        mu = pm.math.exp(β0 + βR*data["R"] + βF*data["F"] + βM*data["M"])
+        # ZIG likelihood
+        psi = pm.math.exp(-mu/phi)
+        log_zero = pm.math.log(psi + 1e-12)
+        alpha = mu/phi; beta = 1/phi
+        log_pos = (pm.math.log1p(-psi + 1e-12) +
+                   (alpha-1)*pm.math.log(data["y"] + 1e-12) -
+                   data["y"]*beta + alpha*pm.math.log(beta) - pm.math.gammaln(alpha))
+        logp = pm.where(data["y"]==0, log_zero, log_pos)
+        logp = pm.Deterministic("log_likelihood", logp, dims=("customer","week"))
+        pm.Potential("ll", logp[data["mask"]].sum())
+        idata = pm.sample(draws=draws, chains=chains, target_accept=0.9,
+                          random_seed=seed, cores=min(chains, 4))
+        pm.compute_log_likelihood(idata)   # adds log_likelihood group
+    return idata
+
+# ------------------------------------------------------------------
+# 3.  HMM  FORWARD  (vectorised, ZIG, batched, mask-aware)
+# ------------------------------------------------------------------
+def forward_zig(y, mask, log_pi0, log_Gamma, mu, phi):
+    """
+    y, mask : (N, T)
+    log_pi0 : (K,)
+    log_Gamma : (K, K)
+    mu, phi : (N, T, K)
+    returns log-marginal likelihood (N,) and point-wise (N,T)
+    """
+    N, T, K = mu.shape
+    log_alpha = log_pi0 + np.where(mask[:,0:1], np.where(y[:,0:1]==0,
+                                        np.exp(-mu[:,0,:]/phi[:,0,:]),
+                                        np.exp(-mu[:,0,:]/phi[:,0,:])), 0.0)
+    log_like = np.zeros((N, T))
+    for t in range(1, T):
+        temp = log_alpha[:, :, None] + log_Gamma[None, :, :]          # (N,K,K)
+        log_alpha = logsumexp(temp, axis=1)                           # (N,K)
+        log_alpha += np.where(mask[:,t:t+1],
+                              np.where(y[:,t:t+1]==0,
+                                       np.log(np.exp(-mu[:,t,:]/phi[:,t,:]) + 1e-12),
+                                       np.log1p(-np.exp(-mu[:,t,:]/phi[:,t,:]) + 1e-12) +
+                                       gamma_logp(y[:,t:t+1], mu[:,t,:], phi[:,t,:])), 0.0)
+        log_like[:, t] = logsumexp(log_alpha, axis=1)
+    log_like[:,0] = logsumexp(log_alpha[:,0,:], axis=1)
+    return logsumexp(log_alpha, axis=1), log_like
+
+def gamma_logp(y, mu, phi):
+    alpha = mu/phi; beta = 1/phi
+    return (alpha-1)*np.log(y+1e-12) - y*beta + alpha*np.log(beta) - gammaln(alpha)
+
+# ------------------------------------------------------------------
+# 4.  SMC  RUNNER  (K=2,3,4,5)  →  returns az.InferenceData  +  metrics
+# ------------------------------------------------------------------
+def run_smc_hmm(csv_path, K, draws=2000, chains=4, seed=42, out_dir="results"):
+    out_dir = pathlib.Path(out_dir); out_dir.mkdir(exist_ok=True)
+    data = build_panel(csv_path)
+    with pm.Model(coords={"state":np.arange(K),"customer":np.arange(data["N"]),"week":np.arange(data["T"])}) as mod:
+        # --- priors (ordered for identifiability) ---
+        pi0   = pm.Dirichlet("pi0", a=np.ones(K))
+        Gamma = pm.Dirichlet("Gamma", a=np.ones(K), shape=(K,K))
+        beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
+        beta0     = pm.Deterministic("beta0", pt.sort(beta0_raw))
+        phi_raw   = pm.Exponential("phi_raw", 10, shape=K)
+        phi       = pm.Deterministic("phi", pt.sort(phi_raw))
+        betaR = pm.Normal("betaR", 0, 1, shape=K)
+        betaF = pm.Normal("betaF", 0, 1, shape=K)
+        betaM = pm.Normal("betaM", 0, 1, shape=K)
+
+        # --- emission ---
+        mu = pt.exp(beta0 + betaR*data["R"][:,:,None] + betaF*data["F"][:,:,None] + betaM*data["M"][:,:,None])
+        mu = pt.clip(mu, 1e-3, 1e6)
+        psi = pt.exp(-mu/phi)
+        log_zero = pt.log(psi + 1e-12)
+        y_exp = data["y"][:,:,None]
+        log_pos  = pt.log1p(-psi + 1e-12) + gamma_logp(y_exp, mu, phi)
+        log_emission = pt.where(y_exp==0, log_zero, log_pos)
+        log_emission = pt.where(data["mask"][:,:,None], log_emission, 0.0)
+
+        # --- forward ---
+        log_alpha = pt.log(pi0) + log_emission[:,0,:]
+        log_Gamma = pt.log(Gamma)
+        for t in range(1, data["T"]):
+            temp = log_alpha[:,:,None] + log_Gamma[None,:,:]
+            log_alpha = log_emission[:,t,:] + pt.logsumexp(temp, axis=1)
+        logp_cust = pt.logsumexp(log_alpha, axis=1)
+        pm.Potential("loglike", logp_cust.sum())
+
+        # --- point-wise for LOO ---
+        logp_obs = pm.Deterministic("log_likelihood",
+                                     pt.logsumexp(log_alpha, axis=1)[:,None]*data["mask"],
+                                     dims=("customer","week"))
+
+        # --- SMC ---
+        idata = pm.sample_smc(draws=draws, chains=chains, random_seed=seed,
+                              cores=min(chains, 4))
+        pm.compute_log_likelihood(idata)   # adds log_likelihood group
+
+    # --- metrics ---
+    log_ev = float(pt.logsumexp(idata.sample_stats["log_marginal_likelihood"].values) -
+                   np.log(idata.sample_stats["log_marginal_likelihood"].size))
+    res = {"K": K, "log_evidence": log_ev}
+    pkl_path = out_dir / f"smc_K{K}_D{draws}.pkl"
+    with open(pkl_path, "wb") as f:
+        pickle.dump({"idata": idata, "res": res}, f)
+    print(f"K={K}  log-ev={log_ev:.2f}  saved → {pkl_path}")
+    return idata, res
+
+# ------------------------------------------------------------------
+# 5.  TABLE  HELPERS  (LOO / WAIC / log-ev)
+# ------------------------------------------------------------------
+def table_ablation(idata, name, out_csv=None):
+    """Return 1-row DF with ELPD-LOO, p_loo, SE-LOO, WAIC, SE-WAIC, log-ev."""
+    if "log_likelihood" not in idata.groups():
+        raise KeyError("run add_log_likelihood or use SMC idata with log_likelihood group")
+    loo  = az.loo(idata, pointwise=True)
+    waic = az.waic(idata, pointwise=True)
+    logev = float(az.summary(idata, var_names=["log_marginal_likelihood"])["mean"].iloc[0])
+    df = pd.DataFrame({"Model": [name],
+                       "ELPD-LOO": loo.elpd_loo,
+                       "p_loo": loo.p_loo,
+                       "SE-LOO": loo.se,
+                       "WAIC": waic.elpd_waic,
+                       "SE-WAIC": waic.se,
+                       "log_evidence": logev})
+    if out_csv:
+        df.to_csv(out_csv, index=False)
+    return df
+    
+
 # ----------  1.  DATA LOADER  -----------------------------------------------
 def load_panel_csv(csv_path: str | pathlib.Path, customer_col: str = "customer_id") -> dict:
     """
@@ -103,6 +263,7 @@ def add_log_likelihood(idata: az.InferenceData, csv_path: str | pathlib.Path) ->
     logp_ds = xr.Dataset({"log_likelihood": logp_da})
     #return az.InferenceData(log_likelihood=logp_da, **idata.groups())
     return az.concat([idata, az.InferenceData(log_likelihood=logp_ds)], dim=None)
+
 
 # ----------  4.  TABLES 5-9  -------------------------------------------------
 def make_table5(idata: az.InferenceData, ds_name: str, out_dir: pathlib.Path | None = None) -> pd.DataFrame:

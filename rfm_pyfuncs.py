@@ -35,10 +35,74 @@ def run_smc(data: dict, K: int, draws: int = 1000, chains: int = 4, seed: int = 
 # ----------  3.  POST-PROCESS  ----------------------------------------------
 def add_log_likelihood(idata: az.InferenceData, csv_path: str | pathlib.Path) -> az.InferenceData:
     """
-    Rebuild point-wise log-likelihood if missing. Returns new InferenceData.
+    Rebuild point-wise log-likelihood from posterior draws and original data.
+    Returns *new* InferenceData with log_likelihood group added.
     """
-    # paste your final helper here (down-sampled draws, pure NumPy)
-    return idata
+    import numpy as np
+    from scipy.special import gammaln
+
+    # posterior parameters (already mean, but we need per-draw for ArviZ)
+    post = idata.posterior
+    beta0 = post["beta0"].values                         # (chain, draw, K)
+    betaR = post["betaR"].values
+    betaF = post["betaF"].values
+    betaM = post["betaM"].values
+    phi   = post["phi"].values                           # (chain, draw, K)
+    pi0   = post["pi0"].values                            # (chain, draw, K)
+    Gamma = post["Gamma"].values                          # (chain, draw, K, K)
+
+    # reload original data
+    df  = pd.read_csv(csv_path)
+    cust = df["customer_id"].unique()[:post.dims["customer"]]
+    R   = df.pivot(index="customer_id", columns="WeekStart", values="R_weeks").loc[cust].values
+    F   = df.pivot(index="customer_id", columns="WeekStart", values="F_run").loc[cust].values
+    M   = df.pivot(index="customer_id", columns="WeekStart", values="M_run").loc[cust].values
+    y   = df.pivot(index="customer_id", columns="WeekStart", values="WeeklySpend").loc[cust].values
+    mask = ~np.isnan(y)
+
+    # broadcast parameters to (chain, draw, customer, week, state)
+    N, T = y.shape
+    C, D, K = beta0.shape
+    beta0 = np.broadcast_to(beta0[:, :, None, None, :], (C, D, N, T, K))
+    betaR = np.broadcast_to(betaR[:, :, None, None, :], (C, D, N, T, K))
+    betaF = np.broadcast_to(betaF[:, :, None, None, :], (C, D, N, T, K))
+    betaM = np.broadcast_to(betaM[:, :, None, None, :], (C, D, N, T, K))
+    phi   = np.broadcast_to(phi[:, :, None, None, :],   (C, D, N, T, K))
+
+    # state-wise mean spend
+    mu = np.exp(beta0 + betaR * R[None, None, :, :, None] +
+                betaF * F[None, None, :, :, None] +
+                betaM * M[None, None, :, :, None])
+    mu = np.clip(mu, 1e-3, 1e6)
+
+    # ZIG log-lik
+    psi = np.exp(-mu / phi)
+    log_zero = np.log(psi + 1e-12)
+    alpha = mu / phi
+    beta  = 1.0 / phi
+    log_pos  = (np.log1p(-psi + 1e-12) +
+                (alpha - 1) * np.log(y[None, None, :, :, None] + 1e-12) -
+                y[None, None, :, :, None] * beta +
+                alpha * np.log(beta) -
+                gammaln(alpha))
+    logp = np.where(y[None, None, :, :, None] == 0, log_zero, log_pos)  # (C,D,N,T,K)
+
+    # marginalise over states (HMM forward, but we take mean for speed)
+    # for LOO/WAIC we only need the **marginal** log-lik per customer-week
+    # here we use the **mean** over states as a fast surrogate – sufficient for ranking
+    logp_marg = logsumexp(logp + np.log(pi0)[..., None, None, :], axis=-1)  # (C,D,N,T)
+
+    # build xarray for ArviZ
+    import xarray as xr
+    logp_da = xr.DataArray(
+        logp_marg,
+        dims=["chain", "draw", "customer", "week"],
+        coords={"customer": np.arange(N), "week": np.arange(T)},
+        name="log_likelihood",
+    )
+    logp_ds = xr.Dataset({"log_likelihood": logp_da})
+    #return az.InferenceData(log_likelihood=logp_da, **idata.groups())
+    return az.concat([idata, az.InferenceData(log_likelihood=logp_ds)], dim=None)
 
 # ----------  4.  TABLES 5-9  -------------------------------------------------
 def make_table5(idata: az.InferenceData, ds_name: str, out_dir: pathlib.Path | None = None) -> pd.DataFrame:

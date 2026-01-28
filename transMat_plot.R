@@ -3,118 +3,84 @@ library(ggraph)
 library(igraph)
 library(ggforce)
 
-plot_hmm_transitions <- function(Gamma, 
-                                 title = "Posterior Mean Transition Probabilities (K = 3)",
-                                 subtitle = "10,000 MCMC draws", 
-                                 digits = 3) {
+plot_hmm_transitions_high_contrast <- function(Gamma, dataset_name = "Dataset") {
+  require(igraph)
+  K <- nrow(Gamma)
   
-  if (!all.equal(dim(Gamma), c(3,3))) stop("Gamma must be a 3×3 matrix")
-  if (is.null(rownames(Gamma))) stop("Gamma must have row names (state names)")
+  # 1. Geometry
+  angles <- seq(pi/2, pi/2 - 2*pi, length.out = K + 1)[1:K]
+  pts <- cbind(cos(angles), sin(angles))
   
-  # Edge data
-  edges <- as.data.frame(as.table(Gamma)) %>%
-    set_names(c("from", "to", "prob")) %>%
-    mutate(prob_label = sprintf(paste0("%.", digits, "f"), prob))
+  # 2. Build Graph
+  g <- graph_from_adjacency_matrix(Gamma, weighted = TRUE, diag = TRUE)
   
-  self_loops  <- edges %>% filter(from == to)
-  inter_edges <- edges %>% filter(from != to)
+  # 3. Enhanced Aesthetics
+  # We use a log-ish scaling or a floor to ensure small edges don't disappear
+  # This makes the 0.001 edges visible but the 0.99 edges clearly dominant
+  E(g)$width <- (E(g)$weight * 10) + 0.5 
   
-  # Graph (only inter-state edges for arrows)
-  g <- graph_from_data_frame(inter_edges,
-                             vertices = data.frame(name = rownames(Gamma)))
+  # Force a dark, consistent color for all visible edges
+  edge_col <- adjustcolor("grey20", alpha.f = 0.8) 
   
-  # Fixed triangle layout — order matches rownames
-  manual_layout <- data.frame(
-    name = rownames(Gamma),
-    x = c(0, 1.5, 3),
-    y = c(0, 2, 0)
-  )
+  # Labels only for substantial transitions to keep it clean
+  E(g)$label <- ifelse(E(g)$weight > 0.03, round(E(g)$weight, 2), "")
   
-  # Plot
-  ggraph(g, layout = manual_layout) +
-    # Curved inter-state arrows
-    geom_edge_arc(aes(width = prob),
-                  strength = 0.35,
-                  arrow = arrow(length = unit(5, "mm"), type = "closed"),
-                  start_cap = circle(18, "mm"),
-                  end_cap = circle(18, "mm"),
-                  colour = "grey30") +
-    
-    # White halo for edge labels
-    geom_edge_arc(aes(label = prob_label),
-                  strength = 0.35,
-                  label_colour = "white",
-                  label_size = 9,                   # thick halo
-                  label_dodge = unit(6, "mm"),
-                  angle_calc = "along",
-                  force_flip = TRUE,
-                  show.legend = FALSE) +
-    
-    # Black text on top
-    geom_edge_arc(aes(label = prob_label),
-                  strength = 0.35,
-                  label_colour = "black",
-                  label_size = 4.5,
-                  label_dodge = unit(6, "mm"),
-                  angle_calc = "along",
-                  force_flip = TRUE,
-                  show.legend = FALSE) +
-    
-    scale_edge_width(range = c(1.5, 7), guide = "none") +
-    
-    # Self-loops: dashed ovals (angle now inside aes!)
-    geom_ellipse(data = self_loops,
-                 aes(x0 = manual_layout$x[match(from, manual_layout$name)],
-                     y0 = manual_layout$y[match(from, manual_layout$name)] + 0.4,
-                     a = prob * 1.2,      # horizontal radius
-                     b = 0.4,             # vertical radius
-                     angle = 0),          # <-- must be in aes()
-                 colour = "grey50", fill = NA, linetype = "dashed", linewidth = 1.2) +
-    
-    # White rectangular labels for self-loops
-    geom_label(data = self_loops,
-               aes(x = manual_layout$x[match(from, manual_layout$name)],
-                   y = manual_layout$y[match(from, manual_layout$name)] + 0.9,
-                   label = prob_label),
-               fill = "white", colour = "black",
-               size = 4.5, fontface = "bold", label.size = 0.5) +
-    
-    # Nodes
-    geom_node_point(size = 35, fill = "white", shape = 21, stroke = 2, colour = "grey20") +
-    geom_node_text(aes(label = name), fontface = "bold", size = 6) +
-    
-    coord_fixed(xlim = c(-0.6, 3.6), ylim = c(-0.6, 2.6)) +
-    theme_void() +
-    labs(title = title,
-         subtitle = paste0(subtitle, "   •   Self-loop probabilities shown as dashed ovals")) +
-    theme(plot.title    = element_text(hjust = 0.5, size = 14, face = "bold"),
-          plot.subtitle = element_text(hjust = 0.5, size = 11, colour = "grey40"))
+  # 4. The Plot
+  par(mar = c(1, 1, 1, 1))
+  plot(g, 
+       layout = pts,
+       edge.arrow.size = 0.5,       # Slightly larger arrows
+       edge.arrow.width = 1.2,      # Braoder arrowheads for visibility
+       edge.curved = 0.25,
+       edge.color = edge_col,       # Consistent dark gray
+       edge.label = E(g)$label,
+       edge.label.cex = 0.8,
+       edge.label.color = "black",
+       edge.label.font = 2,         # Bold labels
+       edge.loop.angle = angles,
+       edge.loop.size = 1.6,        # Pushed slightly further out
+       vertex.size = 28,
+       vertex.color = "white",
+       vertex.frame.color = "black",
+       vertex.frame.width = 1.5,
+       vertex.label.cex = 1.1,
+       vertex.label.font = 2,
+       vertex.label = paste0("S", 0:(K-1)),
+       main = paste0("HMM Transitions: ", dataset_name, " (K=", K, ")"))
 }
+
 
 # ——————————————————
 # Example usage
 # ——————————————————
+# UCI Transition Matrix (K=5)
+# Rows: From State (0-4), Cols: To State (0-4)
+gamma_uci <- matrix(c(
+  0.160221, 0.065635, 0.260256, 0.401197, 0.112675, # From State 0
+  0.054096, 0.131152, 0.079141, 0.599510, 0.136082, # From State 1
+  0.100929, 0.196401, 0.348891, 0.215821, 0.137972, # From State 2
+  0.200281, 0.095453, 0.310740, 0.366014, 0.027490, # From State 3
+  0.096869, 0.391955, 0.365728, 0.021374, 0.124042  # From State 4
+), nrow = 5, byrow = TRUE)
 
-Gamma_uci <- matrix(c(0.318, 0.323, 0.359,
-                      0.291, 0.290, 0.418,
-                      0.270, 0.274, 0.456), nrow = 3, byrow = TRUE)
-rownames(Gamma_uci) <- colnames(Gamma_uci) <- c("Engaged", "Cooling", "Churned")
+# Assign state names for the plot
+colnames(gamma_uci) <- rownames(gamma_uci) <- c("S0", "S1", "S2", "S3", "S4")
 
-p <- plot_hmm_transitions(Gamma_uci,
-                          title = "UCI: Posterior Mean Transition Probabilities (K = 3)")
+plot_hmm_transitions_high_contrast(gamma_uci, "UCI Online Retail")
 
-print(p)  # displays in R
 
-ggsave("uci_hmm_final.pdf", plot = p, width = 10, height = 7, dpi = 400)
 
-### ---- for CDNOW
+## ---- CDNOW Transition Matrix (K=4)
+# Rows: From State (0-3), Cols: To State (0-3)
+gamma_cdnow <- matrix(c(
+  0.658361, 0.154916, 0.002700, 0.184017, # From State 0
+  0.117717, 0.715590, 0.001322, 0.165366, # From State 1
+  0.002635, 0.001810, 0.991690, 0.003865, # From State 2
+  0.173029, 0.218621, 0.499345, 0.109006  # From State 3
+), nrow = 4, byrow = TRUE)
 
-Gamma_cdn <- matrix(c(0.456, 0.271, 0.273,
-                      0.360, 0.322, 0.318,
-                      0.418, 0.289, 0.293), nrow = 3, byrow = TRUE)
-rownames(Gamma_cdn) <- colnames(Gamma_cdn) <- c("Engaged", "Cooling", "Churned")
+# Assign state names
+colnames(gamma_cdnow) <- rownames(gamma_cdnow) <- c("S0", "S1", "S2", "S3")
 
-plot_hmm_transitions(Gamma_cdn, title = "CDNOW: Posterior Mean Transition Probabilities (K = 3)")
-
-ggsave("cdnow_hmm_final.pdf", plot = p, width = 10, height = 7, dpi = 400)
-
+# Call your generic function
+plot_hmm_transitions_high_contrast(gamma_cdnow, "CDNOW Marketplace")

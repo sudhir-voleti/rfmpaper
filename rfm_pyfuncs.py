@@ -1,33 +1,16 @@
 # rfmpaper/rfm_funcs.py  (journal-ready, PEP-8, type-hinted)
 
-from __future__ import annotations
-import pathlib, pickle, pandas as pd, numpy as np, arviz as az, matplotlib.pyplot as plt, seaborn as sns
-from scipy.special import gammaln, logsumexp
-import pymc as pm
-import pytensor.tensor as pt
-from tqdm import tqdm
-
-# rfm_pyfuncs.py  (upgrade snapshot)
 import pathlib, pickle, pandas as pd, numpy as np, xarray as xr, arviz as az
 import pymc as pm, pytensor.tensor as pt
 from scipy.special import logsumexp, gammaln
 import pytensor
-pytensor.config.floatX = 'float32'          # M1 speed
+#pytensor.config.floatX = 'float32'          # M1 speed
 
 # ------------------------------------------------------------------
 # 1.  DATA  (one-liner rectangular panel)
 # ------------------------------------------------------------------
-def build_panel(csv_path, cust="customer_id", date="WeekStart"):
-    """Return dict ready for model constructors."""
-    df = pd.read_csv(csv_path, parse_dates=[date])
-    assert df.groupby(cust).size().nunique() == 1, "unbalanced panel"
-    mat = lambda c: df.pivot(index=cust, columns=date, values=c).values
-    return dict(N=df[cust].nunique(),
-                T=df.groupby(cust).size().iloc[0],
-                y=mat("WeeklySpend"),
-                mask=~np.isnan(mat("WeeklySpend")),
-                R=mat("R_weeks"), F=mat("F_run"), M=mat("M_run"))
-
+df = pd.read_csv(csv_path)
+'''
 # ------------------------------------------------------------------
 # 2.  STATIC  TWEEDIE-GAM  +  LOO/WAIC
 # ------------------------------------------------------------------
@@ -55,10 +38,49 @@ def static_tweedie_gam_loo(csv_path, draws=1000, chains=4, seed=42):
                           random_seed=seed, cores=min(chains, 4))
         pm.compute_log_likelihood(idata)   # adds log_likelihood group
     return idata
+'''
+
 
 # ------------------------------------------------------------------
-# 3.  HMM  FORWARD  (vectorised, ZIG, batched, mask-aware)
+# 5.  TABLE  HELPERS  (LOO / WAIC / log-ev)
 # ------------------------------------------------------------------
+def table_ablation(idata, name, out_csv=None):
+    """Return 1-row DF with ELPD-LOO, p_loo, SE-LOO, WAIC, SE-WAIC, log-ev."""
+    if "log_likelihood" not in idata.groups():
+        raise KeyError("run add_log_likelihood or use SMC idata with log_likelihood group")
+    loo  = az.loo(idata, pointwise=True)
+    waic = az.waic(idata, pointwise=True)
+    logev = float(az.summary(idata, var_names=["log_marginal_likelihood"])["mean"].iloc[0])
+    df = pd.DataFrame({"Model": [name],
+                       "ELPD-LOO": loo.elpd_loo,
+                       "p_loo": loo.p_loo,
+                       "SE-LOO": loo.se,
+                       "WAIC": waic.elpd_waic,
+                       "SE-WAIC": waic.se,
+                       "log_evidence": logev})
+    if out_csv:
+        df.to_csv(out_csv, index=False)
+    return df
+    
+
+# ----------  1.  DATA LOADER  -----------------------------------------------
+def load_panel_csv(csv_path: str | pathlib.Path, customer_col: str = "customer_id") -> dict:
+    """
+    Returns dict:  y, mask, R, F, M, N, T  (all NumPy arrays)
+    """
+    df = pd.read_csv(csv_path, parse_dates=["WeekStart"])
+    df = df.astype({customer_col: str})
+    cust = df[customer_col].unique()
+    y   = df.pivot(index=customer_col, columns="WeekStart", values="WeeklySpend").loc[cust].values
+    mask = ~np.isnan(y)
+    R   = df.pivot(index=customer_col, columns="WeekStart", values="R_weeks").loc[cust].values
+    F   = df.pivot(index=customer_col, columns="WeekStart", values="F_run").loc[cust].values
+    M   = df.pivot(index=customer_col, columns="WeekStart", values="M_run").loc[cust].values
+    return {"y": y, "mask": mask, "R": R, "F": F, "M": M, "N": y.shape[0], "T": y.shape[1]}
+
+# ----------  2.  SMC RUNNER  -------------------------------------------------
+
+# 2A.  HMM  FORWARD  (vectorised, ZIG, batched, mask-aware)
 def forward_zig(y, mask, log_pi0, log_Gamma, mu, phi):
     """
     y, mask : (N, T)
@@ -89,7 +111,7 @@ def gamma_logp(y, mu, phi):
     return (alpha-1)*np.log(y+1e-12) - y*beta + alpha*np.log(beta) - gammaln(alpha)
 
 # ------------------------------------------------------------------
-# 4.  SMC  RUNNER  (K=2,3,4,5)  →  returns az.InferenceData  +  metrics
+# 2B.  SMC  RUNNER  (K=2,3,4,5)  →  returns az.InferenceData  +  metrics
 # ------------------------------------------------------------------
 def run_smc_hmm(csv_path, K, draws=2000, chains=4, seed=42, out_dir="results"):
     out_dir = pathlib.Path(out_dir); out_dir.mkdir(exist_ok=True)
@@ -144,53 +166,6 @@ def run_smc_hmm(csv_path, K, draws=2000, chains=4, seed=42, out_dir="results"):
         pickle.dump({"idata": idata, "res": res}, f)
     print(f"K={K}  log-ev={log_ev:.2f}  saved → {pkl_path}")
     return idata, res
-
-# ------------------------------------------------------------------
-# 5.  TABLE  HELPERS  (LOO / WAIC / log-ev)
-# ------------------------------------------------------------------
-def table_ablation(idata, name, out_csv=None):
-    """Return 1-row DF with ELPD-LOO, p_loo, SE-LOO, WAIC, SE-WAIC, log-ev."""
-    if "log_likelihood" not in idata.groups():
-        raise KeyError("run add_log_likelihood or use SMC idata with log_likelihood group")
-    loo  = az.loo(idata, pointwise=True)
-    waic = az.waic(idata, pointwise=True)
-    logev = float(az.summary(idata, var_names=["log_marginal_likelihood"])["mean"].iloc[0])
-    df = pd.DataFrame({"Model": [name],
-                       "ELPD-LOO": loo.elpd_loo,
-                       "p_loo": loo.p_loo,
-                       "SE-LOO": loo.se,
-                       "WAIC": waic.elpd_waic,
-                       "SE-WAIC": waic.se,
-                       "log_evidence": logev})
-    if out_csv:
-        df.to_csv(out_csv, index=False)
-    return df
-    
-
-# ----------  1.  DATA LOADER  -----------------------------------------------
-def load_panel_csv(csv_path: str | pathlib.Path, customer_col: str = "customer_id") -> dict:
-    """
-    Returns dict:  y, mask, R, F, M, N, T  (all NumPy arrays)
-    """
-    df = pd.read_csv(csv_path, parse_dates=["WeekStart"])
-    df = df.astype({customer_col: str})
-    cust = df[customer_col].unique()
-    y   = df.pivot(index=customer_col, columns="WeekStart", values="WeeklySpend").loc[cust].values
-    mask = ~np.isnan(y)
-    R   = df.pivot(index=customer_col, columns="WeekStart", values="R_weeks").loc[cust].values
-    F   = df.pivot(index=customer_col, columns="WeekStart", values="F_run").loc[cust].values
-    M   = df.pivot(index=customer_col, columns="WeekStart", values="M_run").loc[cust].values
-    return {"y": y, "mask": mask, "R": R, "F": F, "M": M, "N": y.shape[0], "T": y.shape[1]}
-
-# ----------  2.  SMC RUNNER  -------------------------------------------------
-def run_smc(data: dict, K: int, draws: int = 1000, chains: int = 4, seed: int = 42, out_dir: pathlib.Path | None = None) -> az.InferenceData:
-    """
-    Full-panel SMC for chosen K. Returns InferenceData.
-    """
-    import time, pathlib, os
-    N, T = data["N"], data["T"]
-    **old_code_block**  # paste your final SMC block here (no CLI inside)
-    return idata
 
 # ----------  3.  POST-PROCESS  ----------------------------------------------
 def add_log_likelihood(idata: az.InferenceData, csv_path: str | pathlib.Path) -> az.InferenceData:

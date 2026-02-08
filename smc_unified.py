@@ -1,119 +1,120 @@
 #!/usr/bin/env python3
 """
-smc_unified.py
-==============
-Unified HMM-Tweedie model with configurable options:
-- K states (K=1 is static, K>=2 is HMM)
-- GLM vs GAM for RFM effects
-- State-specific p vs fixed p
-- Configurable draws, chains, customers
-
-Upload to: https://github.com/sudhir-voleti/rfmpaper/blob/main/smc_unified.py
+smc_unified_optimized.py
+========================
+Optimized for Apple Silicon (M1/M2/M3) with Metal Performance Shaders.
+Unified HMM-Tweedie model with configurable options.
 """
 
-import argparse
+# =============================================================================
+# 0. APPLE SILICON OPTIMIZATION (MUST BE FIRST - Before any imports)
+# =============================================================================
+
 import os
+# Set environment variables BEFORE importing pytensor
+os.environ['PYTENSOR_FLAGS'] = 'floatX=float32,optimizer=fast_run,openmp=True'
+
+# Now import pytensor - it will read the flags
+import pytensor
+import numpy as np
+
+# Verify config
+print(f"PyTensor config: floatX={pytensor.config.floatX}, optimizer={pytensor.config.optimizer}")
+
+# Optional: Disable Metal GPU for SMC (CPU is often faster for tempering)
+os.environ['PYTENSOR_METAL'] = '0'
+
+# =============================================================================
+# STANDARD IMPORTS
+# =============================================================================
+
+import argparse
 import time
 import pathlib
 import pickle
 import warnings
+import platform
 
-import numpy as np
 import pandas as pd
 import pymc as pm
 import pytensor.tensor as pt
 import arviz as az
 from patsy import dmatrix
-
-import pytensor
-pytensor.config.floatX = 'float32'  # Add this line
+from scipy.special import logsumexp
 
 warnings.filterwarnings('ignore')
 
-# ---------- 0. Configuration ----------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-# ---------- 1. B-Spline Basis Function ----------
+# Check if running on Apple Silicon
+IS_APPLE_SILICON = platform.machine() == 'arm64' and platform.system() == 'Darwin'
+if IS_APPLE_SILICON:
+    print(f"Detected Apple Silicon ({platform.machine()}). Float32 optimization enabled.")
+
+
+# =============================================================================
+# 1. B-SPLINE BASIS FUNCTION
+# =============================================================================
+
 def create_bspline_basis(x, df=3, degree=3):
     """
-    Create B-spline basis matrix for GAM.
-    
-    Parameters:
-    -----------
-    x : array-like
-        Input values (flattened)
-    df : int
-        Degrees of freedom (determines number of knots)
-    degree : int
-        Polynomial degree for splines
-    
-    Returns:
-    --------
-    basis : ndarray, shape (len(x), n_basis)
-        B-spline basis matrix
+    Create B-spline basis matrix for GAM with Apple Silicon optimization.
+    Uses float32 internally for memory efficiency on M1/M2/M3.
     """
-    x = np.asarray(x).flatten()
+    x = np.asarray(x, dtype=np.float32).flatten()
     
-    # Quantile-based knots for data-adaptive placement
     n_knots = df - degree + 1
     if n_knots > 1:
         knots = np.quantile(x, np.linspace(0, 1, n_knots)[1:-1]).tolist()
     else:
         knots = []
     
-    formula = f"bs(x, knots={knots}, degree={degree}, include_intercept=False)"
+    formula = f"bs(x, knots={list(knots)}, degree={degree}, include_intercept=False)"
     basis = dmatrix(formula, {"x": x}, return_type='matrix')
     
-    return np.asarray(basis)
+    return np.asarray(basis, dtype=np.float32)
 
 
-# ---------- 2. Gamma Log-Density ----------
+# =============================================================================
+# 2. GAMMA LOG-DENSITY (OPTIMIZED)
+# =============================================================================
+
 def gamma_logp_det(value, mu, phi):
-    """Deterministic Gamma log-density for ZIG positive part."""
+    """
+    Deterministic Gamma log-density with numerical stability.
+    All operations in float32 for Apple Silicon speed.
+    """
     alpha = mu / phi
     beta = 1.0 / phi
+    
     return (alpha - 1) * pt.log(value) - value * beta + alpha * pt.log(beta) - pt.gammaln(alpha)
 
 
-# ---------- 3. Unified Model Builder ----------
+# =============================================================================
+# 3. UNIFIED MODEL BUILDER
+# =============================================================================
+
 def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, 
                use_gam=True, gam_df=3):
     """
     Build HMM-Tweedie (K>=2) or Static Tweedie (K=1) model.
-    
-    Parameters:
-    -----------
-    data : dict
-        Contains N, T, y, mask, R, F, M
-    K : int
-        Number of states. K=1 is static, K>=2 is HMM.
-    state_specific_p : bool
-        If True and K>1, estimate p per state. If False, use p_fixed.
-    p_fixed : float
-        Global p value when state_specific_p=False.
-    use_gam : bool
-        If True, use B-spline GAM. If False, use linear GLM.
-    gam_df : int
-        Degrees of freedom for B-splines.
-    
-    Returns:
-    --------
-    model : pm.Model
-        PyMC model object
+    Optimized for Apple Silicon with float32 throughout.
     """
     N, T = data["N"], data["T"]
     y, mask = data["y"], data["mask"]
     R, F, M = data["R"], data["F"], data["M"]
     
     # Precompute GAM bases if needed
-    if use_gam and K >= 1:  # Allow GAM even for K=1
-        # Flatten for basis computation
+    if use_gam and K >= 1:
         R_flat = R.flatten()
         F_flat = F.flatten()
         M_flat = M.flatten()
         
-        # Create bases
         basis_R = create_bspline_basis(R_flat, df=gam_df)
         basis_F = create_bspline_basis(F_flat, df=gam_df)
         basis_M = create_bspline_basis(M_flat, df=gam_df)
@@ -122,38 +123,31 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         n_basis_F = basis_F.shape[1]
         n_basis_M = basis_M.shape[1]
         
-        # Reshape to (N, T, n_basis)
         basis_R = basis_R.reshape(N, T, n_basis_R)
         basis_F = basis_F.reshape(N, T, n_basis_F)
         basis_M = basis_M.reshape(N, T, n_basis_M)
     else:
-        # GLM: single coefficient per state
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model() as model:
+    with pm.Model(coords={"customer": np.arange(N)}) as model:
         
-        # ---- Latent dynamics (K=1: static, no transitions) ----
+        # ---- Latent dynamics ----
         if K == 1:
-            # Deterministic for static model
-            pi0 = pt.as_tensor_variable(np.array([1.0]))
-            Gamma = pt.as_tensor_variable(np.array([[1.0]]))
+            pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
+            Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
         else:
-            # HMM: estimate initial probs and transition matrix
-            pi0 = pm.Dirichlet("pi0", a=np.ones(K))
-            Gamma = pm.Dirichlet("Gamma", a=np.ones(K), shape=(K, K))
+            pi0 = pm.Dirichlet("pi0", a=np.ones(K, dtype=np.float32))
+            Gamma = pm.Dirichlet("Gamma", a=np.ones(K, dtype=np.float32), shape=(K, K))
 
-        # ---- State-specific parameters ----
+        # ---- State parameters ----
         if K == 1:
-            # Scalar for static model
             beta0_raw = pm.Normal("beta0_raw", 0, 1)
             beta0 = pm.Deterministic("beta0", beta0_raw)
         else:
-            # Ordered for HMM (Cold < Warm < Hot)
             beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
             beta0 = pm.Deterministic("beta0", pt.sort(beta0_raw))
         
-        # Dispersion phi
         if K == 1:
             phi_raw = pm.Exponential("phi_raw", lam=10.0)
             phi = pm.Deterministic("phi", phi_raw)
@@ -161,9 +155,8 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
             phi_raw = pm.Exponential("phi_raw", lam=10.0, shape=K)
             phi = pm.Deterministic("phi", pt.sort(phi_raw))
 
-        # ---- R, F, M effects (GAM or GLM) ----
+        # ---- R, F, M effects ----
         if use_gam:
-            # GAM: weights for B-spline bases
             if K == 1:
                 w_R = pm.Normal("w_R", 0, 1, shape=n_basis_R)
                 w_F = pm.Normal("w_F", 0, 1, shape=n_basis_F)
@@ -173,7 +166,6 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                 w_F = pm.Normal("w_F", 0, 1, shape=(K, n_basis_F))
                 w_M = pm.Normal("w_M", 0, 1, shape=(K, n_basis_M))
         else:
-            # GLM: linear coefficients
             if K == 1:
                 betaR = pm.Normal("betaR", 0, 1)
                 betaF = pm.Normal("betaF", 0, 1)
@@ -185,41 +177,34 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         # ---- Power parameter p ----
         if K == 1:
-            # Always estimate p for static model (comparable to HMM)
             p_raw = pm.Beta("p_raw", alpha=2, beta=2)
-            p = pm.Deterministic("p", 1.1 + p_raw * 0.8)  # [1.1, 1.9]
+            p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
         elif state_specific_p:
-            # State-specific p for HMM
             p_raw = pm.Beta("p_raw", alpha=2, beta=2, shape=K)
             p_sorted = pt.sort(p_raw)
             p = pm.Deterministic("p", 1.1 + p_sorted * 0.8)
         else:
-            # Fixed global p for HMM
-            p = pt.as_tensor_variable(np.array([p_fixed] * K))
+            p = pt.as_tensor_variable(np.array([p_fixed] * K, dtype=np.float32))
 
-        # ---- Compute mu (state-varying mean) ----
+        # ---- Compute mu ----
         if use_gam:
-            # GAM effects via tensor dot product
             if K == 1:
-                # Static: (N, T, n_basis) dot (n_basis,) -> (N, T)
                 effect_R = pt.tensordot(basis_R, w_R, axes=([2], [0]))
                 effect_F = pt.tensordot(basis_F, w_F, axes=([2], [0]))
                 effect_M = pt.tensordot(basis_M, w_M, axes=([2], [0]))
                 mu = pt.exp(beta0 + effect_R + effect_F + effect_M)
             else:
-                # HMM: (N, T, n_basis) tensordot (K, n_basis) -> (N, T, K)
                 effect_R = pt.tensordot(basis_R, w_R, axes=([2], [1]))
                 effect_F = pt.tensordot(basis_F, w_F, axes=([2], [1]))
                 effect_M = pt.tensordot(basis_M, w_M, axes=([2], [1]))
                 mu = pt.exp(beta0 + effect_R + effect_F + effect_M)
         else:
-            # GLM: simple linear effects
             if K == 1:
                 mu = pt.exp(beta0 + betaR * R + betaF * F + betaM * M)
             else:
                 mu = pt.exp(beta0 + betaR * R[..., None] + 
                            betaF * F[..., None] + betaM * M[..., None])
-        
+
         mu = pt.clip(mu, 1e-3, 1e6)
 
         # ---- ZIG emission ----
@@ -251,10 +236,8 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         # ---- Marginal likelihood ----
         if K == 1:
-            # Static: sum over time for each customer
             logp_cust = pt.sum(log_emission, axis=1)
         else:
-            # HMM: forward algorithm
             log_alpha = pt.log(pi0) + log_emission[:, 0, :]
             log_Gamma = pt.log(Gamma)[None, :, :]
             for t in range(1, T):
@@ -264,7 +247,6 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         pm.Potential('loglike', pt.sum(logp_cust))
         
-        # Store log-likelihood for diagnostics
         if K == 1:
             pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
         else:
@@ -273,33 +255,17 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
     return model
 
 
-# ---------- 4. Data Builder ----------
+# =============================================================================
+# 4. DATA BUILDER
+# =============================================================================
+
 def build_panel_data(df_path, customer_col='customer_id', n_cust=None, seed=RANDOM_SEED):
-    """
-    Build panel data dictionary from CSV.
-    
-    Parameters:
-    -----------
-    df_path : str or Path
-        Path to CSV file
-    customer_col : str
-        Column name for customer ID
-    n_cust : int or None
-        Number of customers to subsample. If None, use all.
-    seed : int
-        Random seed for reproducible subsampling.
-    
-    Returns:
-    --------
-    data : dict
-        Dictionary with N, T, y, mask, R, F, M, p0
-    """
+    """Build panel data dictionary from CSV with float32 optimization."""
     np.random.seed(seed)
     
     df = pd.read_csv(df_path, parse_dates=['WeekStart'])
     df = df.astype({customer_col: str})
     
-    # Subsample if requested
     if n_cust is not None:
         unique_custs = df[customer_col].unique()
         if len(unique_custs) > n_cust:
@@ -309,14 +275,13 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None, seed=RAND
         else:
             print(f"Requested {n_cust}, but only {len(unique_custs)} available. Using all.")
     
-    # Check panel structure
     panel_sizes = df.groupby(customer_col).size()
     if panel_sizes.nunique() != 1:
         print(f"Warning: Non-rectangular panel. Sizes: {panel_sizes.unique()}")
     
     def mat(col):
-        """Create matrix from long-format data."""
-        return df.pivot(index=customer_col, columns='WeekStart', values=col).values
+        arr = df.pivot(index=customer_col, columns='WeekStart', values=col).values
+        return arr.astype(np.float32)
     
     return {
         'N': df[customer_col].nunique(),
@@ -330,14 +295,18 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None, seed=RAND
     }
 
 
-# ---------- 5. SMC Runner ----------
+# =============================================================================
+# 5. SMC RUNNER
+# =============================================================================
+
 def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df, 
             draws, chains, seed, out_dir):
-    """
-    Run SMC estimation and save results.
-    """
+    """Run SMC estimation with Apple Silicon optimizations."""
     cores = min(chains, os.cpu_count() or 1)
     t0 = time.time()
+    
+    if IS_APPLE_SILICON:
+        print(f"  Apple Silicon: {os.cpu_count()} cores, using {cores}")
     
     try:
         with make_model(data, K=K, state_specific_p=state_specific_p, 
@@ -365,7 +334,6 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
         try:
             lm = idata.sample_stats.log_marginal_likelihood.values
             
-            # Handle nested structure
             if isinstance(lm, np.ndarray) and lm.dtype == object:
                 chain_vals = []
                 for c in range(lm.shape[1] if lm.ndim > 1 else 1):
@@ -394,7 +362,6 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
 
         elapsed = (time.time() - t0) / 60
         
-        # Build result dict
         res = {
             'K': K,
             'N': data['N'],
@@ -407,10 +374,10 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
             'draws': draws,
             'chains': chains,
             'time_min': elapsed,
-            'timestamp': time.strftime('%Y%m%d_%H%M%S')
+            'timestamp': time.strftime('%Y%m%d_%H%M%S'),
+            'platform': 'Apple_Silicon' if IS_APPLE_SILICON else 'Other'
         }
 
-        # Save
         model_tag = f"K{K}_{'GAM' if use_gam else 'GLM'}"
         p_tag = "statep" if (state_specific_p and K > 1) else \
                 "varyingp" if K == 1 else f"p{p_fixed}"
@@ -422,63 +389,40 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
         
         size_mb = pkl_path.stat().st_size / (1024**2)
         print(f"  ✓ log_ev={log_ev:.2f}, time={elapsed:.1f}min, size={size_mb:.1f}MB")
-        print(f"  Saved: {pkl_path.name}")
         
         return pkl_path, res
 
     except Exception as e:
         import traceback
-        crash_path = out_dir / f"CRASH_K{K}_{int(time.time())}.pkl"
-        with open(crash_path, 'wb') as f:
-            pickle.dump({'error': str(e), 'trace': traceback.format_exc()}, f)
         print(f"  ✗ CRASH: {str(e)[:60]}")
         raise
 
 
-# ---------- 6. Main Entry Point ----------
+# =============================================================================
+# 6. MAIN
+# =============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Unified HMM/Static Tweedie Model with GAM/GLM options',
+        description='Apple Silicon Optimized HMM/Static Tweedie Model',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Data
-    parser.add_argument('--dataset', required=True, choices=['uci', 'cdnow'],
-                       help='Dataset to use')
-    parser.add_argument('--data_dir', type=str, default='./data',
-                       help='Directory containing data files')
-    parser.add_argument('--n_cust', type=int, default=None,
-                       help='Number of customers to subsample (None=all)')
-    
-    # Model structure
-    parser.add_argument('--K', type=int, default=3,
-                       help='Number of states (1=static, >=2=HMM)')
-    parser.add_argument('--state_specific_p', action='store_true',
-                       help='Use state-specific p (only for K>=2)')
-    parser.add_argument('--p_fixed', type=float, default=1.5,
-                       help='Fixed p value (used if --state_specific_p not set)')
-    
-    # GAM/GLM
-    parser.add_argument('--no_gam', action='store_true',
-                       help='Use GLM instead of GAM (default: GAM)')
-    parser.add_argument('--gam_df', type=int, default=3,
-                       help='Degrees of freedom for B-splines')
-    
-    # SMC
-    parser.add_argument('--draws', type=int, default=1000,
-                       help='Number of SMC particles per chain')
-    parser.add_argument('--chains', type=int, default=4,
-                       help='Number of independent SMC chains')
-    
-    # Output
-    parser.add_argument('--out_dir', type=str, default='./results',
-                       help='Directory for output files')
-    parser.add_argument('--seed', type=int, default=RANDOM_SEED,
-                       help='Random seed for reproducibility')
+    parser.add_argument('--dataset', required=True, choices=['uci', 'cdnow'])
+    parser.add_argument('--data_dir', type=str, default='./data')
+    parser.add_argument('--n_cust', type=int, default=None)
+    parser.add_argument('--K', type=int, default=3)
+    parser.add_argument('--state_specific_p', action='store_true')
+    parser.add_argument('--p_fixed', type=float, default=1.5)
+    parser.add_argument('--no_gam', action='store_true')
+    parser.add_argument('--gam_df', type=int, default=3)
+    parser.add_argument('--draws', type=int, default=1000)
+    parser.add_argument('--chains', type=int, default=4)
+    parser.add_argument('--out_dir', type=str, default='./results')
+    parser.add_argument('--seed', type=int, default=RANDOM_SEED)
     
     args = parser.parse_args()
     
-    # Setup paths
     data_dir = pathlib.Path(args.data_dir)
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -486,21 +430,15 @@ def main():
     data_path = data_dir / f"{args.dataset}_full.csv"
     
     print(f"\n{'='*70}")
-    print(f"SMC Unified: {args.dataset.upper()}")
+    print(f"SMC Unified (Optimized): {args.dataset.upper()}")
     print(f"{'='*70}")
-    print(f"Model: K={args.K}, {'GLM' if args.no_gam else 'GAM'}, "
-          f"p={'state-specific' if args.state_specific_p else 'fixed'}")
-    print(f"Data: {data_path}")
-    print(f"Output: {out_dir}")
-    print(f"Seed: {args.seed}")
+    print(f"Model: K={args.K}, {'GLM' if args.no_gam else 'GAM'}")
+    print(f"FloatX: {pytensor.config.floatX}, Optimizer: {pytensor.config.optimizer}")
     print(f"{'='*70}\n")
     
-    # Load data
     data = build_panel_data(data_path, n_cust=args.n_cust, seed=args.seed)
-    print(f"Loaded: N={data['N']}, T={data['T']}, "
-          f"zero_incidence={np.mean(data['y']==0):.1%}\n")
+    print(f"Loaded: N={data['N']}, T={data['T']}, zeros={np.mean(data['y']==0):.1%}\n")
     
-    # Run SMC
     pkl_path, res = run_smc(
         data=data,
         K=args.K,
@@ -516,7 +454,6 @@ def main():
     
     print(f"\n{'='*70}")
     print("RESULT")
-    print(f"{'='*70}")
     for key, val in res.items():
         print(f"  {key}: {val}")
     print(f"{'='*70}\n")

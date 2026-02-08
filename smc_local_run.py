@@ -83,6 +83,7 @@ if __name__ == "__main__":
     parser.add_argument("--state_specific_p", action="store_true")
     parser.add_argument("--n_cust", type=int, default=500)
     parser.add_argument("--draws", type=int, default=500)
+    parser.add_argument("--dataset", choices=['uci', 'cdnow'], default='uci')
     
     args = parser.parse_args()
     

@@ -61,7 +61,7 @@ def k_selection_uci():
         
         try:
             run_smc_from_github(
-                dataset="uci",
+                dataset=dataset,
                 K=K,
                 n_cust=n_cust,
                 draws=draws,
@@ -91,7 +91,7 @@ if __name__ == "__main__":
         k_selection_uci()
     else:
         run_smc_from_github(
-            dataset="uci",
+            dataset=dataset,
             K=args.K,
             n_cust=args.n_cust,
             draws=args.draws,

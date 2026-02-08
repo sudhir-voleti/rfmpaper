@@ -25,6 +25,9 @@ import pytensor.tensor as pt
 import arviz as az
 from patsy import dmatrix
 
+import pytensor
+pytensor.config.floatX = 'float32'  # Add this line
+
 warnings.filterwarnings('ignore')
 
 # ---------- 0. Configuration ----------

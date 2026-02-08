@@ -43,8 +43,8 @@ def run_smc_from_github(dataset, K, n_cust, draws, chains, state_specific_p=Fals
     subprocess.run(cmd, check=True)
 
 
-def k_selection_uci():
-    """Run K-selection sequence for UCI."""
+def k_selection(dataset="uci"):
+    """Run K-selection sequence."""
     
     configs = [
         # (K, state_specific_p, no_gam, n_cust, draws, description)
@@ -79,19 +79,19 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Local SMC runner with GitHub fetch')
     parser.add_argument("--mode", choices=['k_selection', 'single'], default='k_selection')
+    parser.add_argument("--dataset", choices=['uci', 'cdnow'], default='uci')
     parser.add_argument("--K", type=int, default=3)
     parser.add_argument("--state_specific_p", action="store_true")
     parser.add_argument("--n_cust", type=int, default=500)
     parser.add_argument("--draws", type=int, default=500)
-    parser.add_argument("--dataset", choices=['uci', 'cdnow'], default='uci')
     
     args = parser.parse_args()
     
     if args.mode == 'k_selection':
-        k_selection_uci()
+        k_selection(dataset=args.dataset)
     else:
         run_smc_from_github(
-            dataset=dataset,
+            dataset=args.dataset,
             K=args.K,
             n_cust=args.n_cust,
             draws=args.draws,

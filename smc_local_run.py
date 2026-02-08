@@ -43,7 +43,7 @@ def run_smc_from_github(dataset, K, n_cust, draws, chains, state_specific_p=Fals
     subprocess.run(cmd, check=True)
 
 
-def k_selection(dataset="uci"):
+def k_selection(dataset=dataset):
     """Run K-selection sequence."""
     
     configs = [

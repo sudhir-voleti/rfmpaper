@@ -14,9 +14,9 @@ results_dir <- "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 20
 # Load data function (matching your panel structure)
 load_panel_data <- function(dataset, n = 500) {
   if(dataset == "uci") {
-    df <- read_csv(file.path(data_dir, "uci_online_retail.csv"))  # adjust filename if different
+    df <- read_csv(file.path(data_dir, "uci_full.csv"))  # adjust filename if different
   } else if(dataset == "cdnow") {
-    df <- read_csv(file.path(data_dir, "cdnow_tr.csv"))  # adjust filename if different
+    df <- read_csv(file.path(data_dir, "cdnow_full.csv"))  # adjust filename if different
   }
   
   # Sample n customers if needed

@@ -5,109 +5,76 @@
 library(tidyverse)
 library(broom)
 library(MASS)  # for glm.nb
-library(pscl)  # for zeroinfl if needed
 
 # Config
 data_dir <- "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/data"
 results_dir <- "/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results"
 
-# Load data function (matching your panel structure)
+# Load pre-extracted N=500 data
 load_panel_data <- function(dataset, n = 500) {
-  if(dataset == "uci") {
-    df <- read_csv(file.path(data_dir, "uci_full.csv"))  # adjust filename if different
-  } else if(dataset == "cdnow") {
-    df <- read_csv(file.path(data_dir, "cdnow_full.csv"))  # adjust filename if different
+  file_path <- file.path(data_dir, paste0(dataset, "_500.csv"))
+  
+  if(!file.exists(file_path)) {
+    stop(paste("File not found:", file_path, "- Run Python extraction first"))
   }
   
-  # Sample n customers if needed
-  customers <- unique(df$customer_id)
-  if(length(customers) > n) {
-    set.seed(42)  # for reproducibility
-    sampled <- sample(customers, n)
-    df <- df %>% filter(customer_id %in% sampled)
-  }
+  df <- read_csv(file_path, show_col_types = FALSE)
+  
+  cat(sprintf("Loaded %s_500.csv: %d customers, %d observations, %.1f%% zeros\n", 
+              dataset, 
+              length(unique(df$customer_id)),
+              nrow(df),
+              100 * mean(df$spend == 0, na.rm = TRUE)))
   
   return(df)
 }
 
-# Prepare RFM features (matching your covariates)
+# Prepare RFM features
 prep_features <- function(df) {
   df %>%
-    group_by(customer_id) %>%
     mutate(
-      recency = as.numeric(difftime(max(week), week, units = "weeks")),
-      frequency = cumsum(spend > 0),
-      monetary = cummean(ifelse(spend > 0, spend, NA)) %>% zoo::na.locf(na.rm = FALSE) %>% replace_na(0)
-    ) %>%
-    ungroup() %>%
-    mutate(
-      log_recency = log(recency + 1),
-      log_frequency = log(frequency + 1),
-      log_monetary = log(monetary + 1)
+      log_recency = log(R_weeks + 1),
+      log_frequency = log(F_run + 1),
+      log_monetary = log(M_run + 1)
     )
 }
 
-# Model 1: Poisson GLM (count of transactions)
+# Model 1: Poisson GLM
 fit_poisson <- function(df, dataset) {
-  # Aggregate to customer-week level (count transactions per week)
-  df_agg <- df %>%
-    group_by(customer_id, week) %>%
-    summarise(y = sum(spend > 0), .groups = "drop")  # count transactions
-  
-  # Fit Poisson on count
-  model <- glm(y ~ log_recency + log_frequency + log_monetary, 
+  # Fit Poisson on count of transactions (spend > 0)
+  model <- glm((spend > 0) ~ log_recency + log_frequency + log_monetary, 
                data = df, family = poisson(link = "log"))
   
-  # Log-likelihood
-  loglik <- logLik(model)
-  aic <- AIC(model)
-  bic <- BIC(model)
+  loglik <- as.numeric(logLik(model))
   
-  # For comparison with SMC log-evidence: use logLik (approximate)
-  # Note: Poisson is poor fit for clumpy data, expect very negative loglik
-  
-  results <- tibble(
+  tibble(
     dataset = dataset,
     model = "Poisson_GLM",
     N = length(unique(df$customer_id)),
-    log_likelihood = as.numeric(loglik),
-    AIC = aic,
-    BIC = bic,
-    deviance = deviance(model),
-    df.residual = df.residual(model)
+    log_likelihood = loglik,
+    AIC = AIC(model),
+    BIC = BIC(model),
+    converged = TRUE
   )
-  
-  return(list(results = results, model = model))
 }
 
-# Model 2: Negative Binomial (NBD) - allows overdispersion
+# Model 2: Negative Binomial
 fit_nbd <- function(df, dataset) {
-  # Same aggregation
-  df_agg <- df %>%
-    group_by(customer_id, week) %>%
-    summarise(y = sum(spend > 0), .groups = "drop")
-  
-  # Try NBD - may fail to converge on clumpy data (as per your theory)
   tryCatch({
-    model <- glm.nb(y ~ log_recency + log_frequency + log_monetary, 
+    model <- glm.nb((spend > 0) ~ log_recency + log_frequency + log_monetary, 
                     data = df, control = glm.control(maxit = 100))
     
-    loglik <- logLik(model)
-    
-    results <- tibble(
+    tibble(
       dataset = dataset,
-      model = "NBD_GLM", 
+      model = "NBD_GLM",
       N = length(unique(df$customer_id)),
-      log_likelihood = as.numeric(loglik),
+      log_likelihood = as.numeric(logLik(model)),
       AIC = AIC(model),
       BIC = BIC(model),
-      theta = model$theta,  # dispersion parameter
+      theta = model$theta,
       converged = TRUE
     )
-    return(list(results = results, model = model))
-    
   }, error = function(e) {
-    # NBD often fails on extreme zero-inflation (>75%)
     tibble(
       dataset = dataset,
       model = "NBD_GLM",
@@ -129,26 +96,16 @@ run_baselines <- function() {
   for(dataset in c("uci", "cdnow")) {
     cat(sprintf("\nProcessing %s...\n", dataset))
     
-    # Load N=500 sample
-    df_raw <- load_panel_data(dataset, n = 500)
-    df <- prep_features(df_raw)
+    df <- load_panel_data(dataset)
+    df <- prep_features(df)
     
-    # Poisson
     cat("Fitting Poisson...\n")
-    pois_res <- fit_poisson(df, dataset)
-    all_results[[paste0(dataset, "_poisson")]] <- pois_res$results
+    all_results[[paste0(dataset, "_poisson")]] <- fit_poisson(df, dataset)
     
-    # NBD
     cat("Fitting NBD...\n")
-    nbd_res <- fit_nbd(df, dataset)
-    if(is.list(nbd_res) && "results" %in% names(nbd_res)) {
-      all_results[[paste0(dataset, "_nbd")]] <- nbd_res$results
-    } else {
-      all_results[[paste0(dataset, "_nbd")]] <- nbd_res
-    }
+    all_results[[paste0(dataset, "_nbd")]] <- fit_nbd(df, dataset)
   }
   
-  # Combine and save
   results_df <- bind_rows(all_results)
   print(results_df)
   

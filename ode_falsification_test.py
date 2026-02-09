@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-ode_falsification_test.py
-=========================
-Validate "Thermodynamics of RFM" theory using HMM posterior.
-
-Usage:
-    python ode_falsification_test.py --file results/smc_uci_K2_GAM_statep_N500_D500_C4.pkl --dataset uci
+ode_falsification_fixed.py - Extract ODE params from smc_unified.py output
 """
 import argparse
 import pickle
@@ -15,273 +10,216 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-# Try to import plotting libs (optional)
-try:
-    import matplotlib.pyplot as plt
-    HAS_PLT = True
-except:
-    HAS_PLT = False
+def load_nested_idata(pkl_path):
+    """Load idata from nested dict structure"""
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    if isinstance(data, dict) and 'idata' in data:
+        idata = data['idata']
+        res = data.get('res', {})
+        print(f"Loaded: K={res.get('K', 'unknown')}, log_ev={res.get('log_evidence', 'N/A')}")
+        return idata, res
+    else:
+        return data, {}  # Direct idata
 
-try:
-    from scipy.integrate import odeint
-    from scipy.interpolate import UnivariateSpline
-    HAS_SCIPY = True
-except:
-    HAS_SCIPY = False
-
-
-def extract_gamma_diagnostics(idata):
-    """Extract transition matrix and compute kinetic beta"""
+def extract_transition_dynamics(idata):
+    """Extract beta from Gamma transition matrix"""
     try:
-        if not hasattr(idata, 'posterior') or 'Gamma' not in idata.posterior:
-            return None
-            
         gamma_post = idata.posterior['Gamma']  # (chains, draws, K, K)
         gamma_mean = gamma_post.mean(dim=['chain', 'draw']).values
         
         K = gamma_mean.shape[0]
         
-        # Compute persistence (diagonal) as proxy for momentum
+        # Diagonal = persistence (self-transition probability)
         persistence = np.diag(gamma_mean)
         
-        # Compute dominant eigenvalue for system memory
-        eigvals = np.linalg.eigvals(gamma_mean)
-        dominant = np.max(np.real(eigvals))
+        # Off-diagonal = flux between states
+        off_diag_sum = gamma_mean.sum(axis=1) - persistence
         
-        # beta from continuous-time approximation: beta = log(lambda_dom)/dt
-        # dt = 1 week
-        beta = np.log(dominant) if dominant > 0 else 0
+        # Beta from log-odds of persistence (higher persistence = higher momentum)
+        beta = np.log(persistence / (1 - persistence + 1e-6))
         
-        # Off-diagonal flux (conductivity)
-        conductivity = (gamma_mean.sum(axis=1) - persistence) / (K-1)
+        # Conductivity from off-diagonal rates
+        conductivity = off_diag_sum / (K - 1)
         
-        return {
-            'Gamma': gamma_mean,
+        return pd.DataFrame({
+            'state': range(K),
             'persistence': persistence,
-            'dominant_eig': dominant,
-            'beta': beta,
-            'conductivity': conductivity.mean(),
-            'K': K
-        }
+            'beta_raw': beta,
+            'conductivity': conductivity,
+            'gamma_ii': persistence
+        })
     except Exception as e:
         print(f"Error extracting Gamma: {e}")
         return None
 
-
 def extract_recency_dissipation(idata):
-    """Extract delta from GAM Recency smooth slope"""
+    """Extract delta from w_R (Recency smooth weights)"""
     try:
-        # Look for smooth terms in posterior
-        if not hasattr(idata, 'posterior'):
+        if 'w_R' not in idata.posterior:
+            print("No w_R found (might be GLM, not GAM)")
             return None
             
-        post = idata.posterior
+        w_R_post = idata.posterior['w_R']
+        # Shape: (chains, draws, K, n_splines) or (chains, draws, n_splines)
         
-        # Find recency/smooth coefficients (naming varies by model)
-        recency_vars = [v for v in post.data_vars if any(x in v.lower() 
-                       for x in ['recency', 's_r', 'smooth_r', 'f_r'])]
+        w_R_mean = w_R_post.mean(dim=['chain', 'draw']).values
         
-        if not recency_vars:
-            return None
-            
-        # Get smooth coefficients for each state
-        delta_estimates = {}
+        # If state-specific, average absolute weight as dissipation proxy
+        if w_R_mean.ndim == 2:
+            # (K, n_splines)
+            delta_by_state = np.mean(np.abs(w_R_mean), axis=1)
+        else:
+            # Shared across states
+            delta_by_state = np.full(len(idata.posterior['beta0'].mean(dim=['chain', 'draw'])), 
+                                    np.mean(np.abs(w_R_mean)))
         
-        for var in recency_vars:
-            # Try to extract - should have shape involving states
-            coeff = post[var].mean(dim=['chain', 'draw']).values
-            
-            # If state-specific, average absolute slope as dissipation proxy
-            if coeff.ndim > 0:
-                # Take mean absolute value as dissipation strength
-                delta_estimates[var] = float(np.mean(np.abs(coeff)))
-        
-        # Overall delta (average across states)
-        delta = np.mean(list(delta_estimates.values())) if delta_estimates else 0.5
-        
-        return {
-            'delta': delta,
-            'delta_by_var': delta_estimates
-        }
+        return pd.DataFrame({
+            'state': range(len(delta_by_state)),
+            'delta': delta_by_state,
+            'w_R_mean': [float(np.mean(np.abs(w_R_mean[i]))) for i in range(len(delta_by_state))]
+        })
     except Exception as e:
-        print(f"Error extracting delta: {e}")
+        print(f"Error extracting w_R: {e}")
         return None
 
-
-def extract_state_p_values(idata):
-    """Extract state-specific p estimates"""
+def extract_power_params(idata):
+    """Extract state-specific p values"""
     try:
-        if not hasattr(idata, 'posterior') or 'p' not in idata.posterior:
-            return None
-            
         p_post = idata.posterior['p']
         p_mean = p_post.mean(dim=['chain', 'draw']).values
         p_std = p_post.std(dim=['chain', 'draw']).values
         
+        # Check if constrained (ordered transform) or free
+        # p_raw might exist if using ordered transform
+        if 'p_raw' in idata.posterior:
+            print("Note: Using ordered transformation for p")
+        
         if p_mean.ndim == 0:
-            return {'p_global': float(p_mean), 'p_states': None}
+            return None, float(p_mean)
         
-        states = {f'p_{i}': float(p_mean[i]) for i in range(len(p_mean))}
-        states['p_range'] = float(p_mean.max() - p_mean.min())
-        states['p_ordered'] = [float(p_mean[i]) for i in range(len(p_mean))]
-        
-        return {
-            'p_global': None,
-            'p_states': states,
-            'p_std': [float(p_std[i]) for i in range(len(p_std))]
-        }
+        df = pd.DataFrame({
+            'state': range(len(p_mean)),
+            'p_mean': p_mean,
+            'p_std': p_std
+        })
+        return df, None
     except Exception as e:
         print(f"Error extracting p: {e}")
-        return None
+        return None, None
 
-
-def compute_ode_params(gamma_diag, delta):
-    """
-    Compute ODE parameters per state
-    beta_k from diagonal persistence
-    delta_k from GAM (assume constant across states or modify if state-specific GAM)
-    """
-    # beta_k from persistence: high persistence = high momentum
-    beta_k = np.log(gamma_diag + 1e-6)  # log(persist) as proxy
-    
-    # Assume delta constant (or could extract state-specific if model has it)
-    delta_k = np.full_like(beta_k, delta)
-    
-    # Ratio (thermal conductivity proxy)
-    ratio = beta_k / (delta_k + 1e-6)
-    
-    return pd.DataFrame({
-        'state': range(len(beta_k)),
-        'beta': beta_k,
-        'delta': delta_k,
-        'beta_over_delta': ratio,
-        'persistence': gamma_diag
-    })
-
-
-def correlation_test(ode_df, p_values):
-    """Test if p_k correlates with beta/delta"""
-    if p_values is None or 'p_ordered' not in p_values:
+def compute_ode_kinetics(gamma_df, delta_df, p_df):
+    """Merge and compute beta/delta ratios"""
+    if gamma_df is None or delta_df is None or p_df is None:
         return None
     
-    p_vec = np.array(p_values['p_ordered'])
-    ratio_vec = ode_df['beta_over_delta'].values
+    # Merge on state
+    merged = gamma_df.merge(delta_df, on='state').merge(p_df, on='state')
     
-    if len(p_vec) != len(ratio_vec):
-        return None
+    # Avoid division by zero
+    merged['beta_over_delta'] = merged['beta_raw'] / (merged['delta'] + 1e-6)
     
-    corr = np.corrcoef(p_vec, ratio_vec)[0,1]
+    # Normalize for interpretability (z-score)
+    merged['beta_norm'] = (merged['beta_raw'] - merged['beta_raw'].mean()) / merged['beta_raw'].std()
+    merged['delta_norm'] = (merged['delta'] - merged['delta'].mean()) / merged['delta'].std()
     
-    # Linear regression slope
-    slope = np.polyfit(ratio_vec, p_vec, 1)[0]
-    
-    return {
-        'correlation': float(corr),
-        'slope': float(slope),
-        'p_values': p_vec.tolist(),
-        'ratios': ratio_vec.tolist()
-    }
+    return merged
 
-
-def simulate_ode(beta, delta, rho0=0.5, T=53, marketing_pulse=None):
-    """
-    Simulate the propensity ODE:
-    dρ/dt = βρ - δR(t)ρ + αM(t)
+def correlation_test(df):
+    """Test if p correlates with kinetic parameters"""
+    from scipy.stats import pearsonr, spearmanr
     
-    For simplicity, assume R(t) = t (recency increases linearly with time since last purchase)
-    and M(t) = 0 (no external marketing)
-    """
-    if not HAS_SCIPY:
-        return None
+    results = {}
     
-    def dydt(y, t):
-        recency = t  # Time since last purchase proxy
-        # Simple decay model: internal momentum vs recency dissipation
-        return beta * y - delta * recency * y * 0.1  # scaled recency effect
-    
-    t = np.linspace(0, T, 100)
-    y = odeint(dydt, rho0, t)
-    
-    return pd.DataFrame({'time': t, 'propensity': y.flatten()})
-
+    # Pearson correlation
+    if len(df) > 2:
+        r_pearson, p_pearson = pearsonr(df['beta_over_delta'], df['p_mean'])
+        results['pearson_r'] = r_pearson
+        results['pearson_p'] = p_pearson
+        
+        # Spearman (rank correlation, more robust)
+        r_spear, p_spear = spearmanr(df['beta_over_delta'], df['p_mean'])
+        results['spearman_r'] = r_spear
+        results['spearman_p'] = p_spear
+        
+        # Linear fit
+        slope, intercept = np.polyfit(df['beta_over_delta'], df['p_mean'], 1)
+        results['slope'] = slope
+        results['intercept'] = intercept
+    else:
+        # K=2: just report difference
+        diff_p = df['p_mean'].iloc[1] - df['p_mean'].iloc[0]
+        diff_beta = df['beta_over_delta'].iloc[1] - df['beta_over_delta'].iloc[0]
+        results['delta_p'] = diff_p
+        results['delta_beta_delta'] = diff_beta
+        
+    return results
 
 def main():
-    parser = argparse.ArgumentParser(description='ODE Falsification Test for HMM-Tweedie')
-    parser.add_argument('--file', type=str, required=True, help='Path to .pkl file')
-    parser.add_argument('--dataset', type=str, default='unknown', help='Dataset name (uci/cdnow)')
-    parser.add_argument('--output', type=str, default=None, help='Output CSV path')
+    parser = argparse.ArgumentParser(description='ODE Falsification Test - Fixed')
+    parser.add_argument('--file', type=str, required=True)
+    parser.add_argument('--dataset', type=str, default='unknown')
+    parser.add_argument('--output', type=str, default=None)
     args = parser.parse_args()
     
-    print("="*60)
+    print("="*70)
     print(f"ODE FALSIFICATION TEST: {args.dataset}")
-    print("="*60)
+    print("="*70)
     
     # Load
-    with open(args.file, 'rb') as f:
-        idata = pickle.load(f)
+    idata, res = load_nested_idata(args.file)
     
-    # Extract components
-    print("\n1. Extracting kinetic parameters...")
-    gamma_info = extract_gamma_diagnostics(idata)
-    delta_info = extract_recency_dissipation(idata)
-    p_info = extract_state_p_values(idata)
+    # Extract
+    print("\n1. Transition dynamics (Gamma)...")
+    gamma_df = extract_transition_dynamics(idata)
     
-    if not all([gamma_info, delta_info, p_info]):
-        print("✗ Failed to extract necessary components")
-        return
+    print("2. Recency dissipation (w_R)...")
+    delta_df = extract_recency_dissipation(idata)
     
-    # Compute ODE params
-    print(f"\n2. Computing ODE parameters for K={gamma_info['K']} states...")
-    ode_df = compute_ode_params(gamma_info['persistence'], delta_info['delta'])
+    print("3. Power parameters (p)...")
+    p_df, p_global = extract_power_params(idata)
     
-    # Add p values
-    if p_info['p_states']:
-        p_ordered = p_info['p_states']['p_ordered']
-        ode_df['p_k'] = p_ordered[:len(ode_df)]
+    # Merge
+    print("\n4. Computing ODE kinetics...")
+    kinetics_df = compute_ode_kinetics(gamma_df, delta_df, p_df)
+    
+    if kinetics_df is not None:
+        print(kinetics_df.to_string(index=False))
         
-        print("\n3. State-specific estimates:")
-        print(ode_df.to_string(index=False))
+        # Test correlation
+        print("\n5. Correlation test...")
+        corr = correlation_test(kinetics_df)
         
-        # Correlation test
-        print("\n4. Correlation test (p_k vs β/δ)...")
-        corr_result = correlation_test(ode_df, p_info['p_states'])
+        for k, v in corr.items():
+            print(f"   {k}: {v:.4f}" if isinstance(v, float) else f"   {k}: {v}")
         
-        if corr_result:
-            print(f"   Correlation: {corr_result['correlation']:.3f}")
-            print(f"   Regression slope: {corr_result['slope']:.3f}")
-            
-            if corr_result['correlation'] > 0.5:
-                print("   ✓ POSITIVE: Hot states (high p) have high β/δ (momentum dominates dissipation)")
-            elif corr_result['correlation'] < -0.3:
-                print("   ✗ NEGATIVE: Unexpected inverse relationship")
+        # Interpretation
+        print("\n" + "="*70)
+        print("INTERPRETATION:")
+        if 'pearson_r' in corr:
+            if corr['pearson_r'] > 0.5 and corr['pearson_p'] < 0.1:
+                print("✓ STRONG POSITIVE: High β/δ → High p (Boiling Pot confirmed)")
+                print("  Hot states: persistence dominates dissipation")
+            elif corr['pearson_r'] < -0.3:
+                print("✗ INVERSE: Unexpected negative correlation")
             else:
-                print("   ~ WEAK: No clear kinetic relationship detected")
-    
-    # Simulate trajectory
-    if HAS_SCIPY:
-        print("\n5. Simulating ODE trajectory (representative state)...")
-        mid_state = len(ode_df) // 2
-        beta = ode_df.iloc[mid_state]['beta']
-        delta = ode_df.iloc[mid_state]['delta']
+                print("~ WEAK: No clear kinetic relationship")
+        else:
+            # K=2 case
+            if kinetics_df['p_mean'].iloc[1] > kinetics_df['p_mean'].iloc[0]:
+                print("✓ ORDERED: State 1 (hot) has higher p than State 0 (cold)")
+            else:
+                print("? UNORDERED: p values don't align with state labels")
         
-        traj = simulate_ode(beta, delta, T=53)
-        cliff_point = traj[traj['propensity'] < 0.5 * traj['propensity'].iloc[0]]['time'].min()
-        print(f"   Recency cliff at t ≈ {cliff_point:.1f} weeks")
+        # Save
+        if args.output:
+            kinetics_df.to_csv(args.output, index=False)
+            print(f"\n6. Saved to: {args.output}")
+    else:
+        print("✗ Failed to compute kinetics")
     
-    # Save results
-    if args.output:
-        ode_df.to_csv(args.output, index=False)
-        print(f"\n6. Saved results to: {args.output}")
-    
-    print("\n" + "="*60)
-    print("INTERPRETATION:")
-    print("="*60)
-    print("If correlation > 0.5: Kinetic theory VALIDATED")
-    print("  → p_k acts as 'equation of state' for relational reservoir")
-    print("  → Hot states (p≈1.8) = high β/δ (boiling)")
-    print("  → Cold states (p≈1.2) = low β/δ (frozen)")
-    print("="*60)
-
+    print("="*70)
 
 if __name__ == "__main__":
     main()

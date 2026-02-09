@@ -1,100 +1,105 @@
 #!/usr/bin/env python3
 """
-smc_local_run.py
-================
-Local runner that fetches smc_unified.py from GitHub and executes with local settings.
+smc_local_run.py - Modified with dataset prefix in filenames
 """
+import argparse
+import pickle
 import sys
-import pathlib
-import subprocess
+from pathlib import Path
+import urllib.request
 
-# ---------- LOCAL CONFIGURATION ----------
-ROOT = pathlib.Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results")
-DATA_DIR = pathlib.Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/data")
+# Download smc_unified if not present locally
+def fetch_dependency():
+    local_unified = Path("smc_unified.py")
+    if not local_unified.exists():
+        print("Fetching smc_unified.py from GitHub...")
+        url = "https://raw.githubusercontent.com/sudhir-voleti/rfmpaper/main/smc_unified.py"
+        urllib.request.urlretrieve(url, local_unified)
+        print("Downloaded smc_unified.py")
 
-GITHUB_URL = "https://github.com/sudhir-voleti/rfmpaper/blob/main/smc_unified.py"
-EXEC_GITCODE = pathlib.Path(__file__).parent / "exec_gitcode.py"
-# -----------------------------------------
+fetch_dependency()
 
-def run_smc_from_github(dataset, K, n_cust, draws, chains, state_specific_p=False, no_gam=False):
-    """Fetch smc_unified.py from GitHub and run with local settings."""
-    
-    ROOT.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Build command
-    cmd = [
-        sys.executable, str(EXEC_GITCODE), GITHUB_URL,
-        "--dataset", dataset,
-        "--K", str(K),
-        "--n_cust", str(n_cust),
-        "--draws", str(draws),
-        "--chains", str(chains),
-        "--data_dir", str(DATA_DIR),
-        "--out_dir", str(ROOT),
-    ]
-    
-    if state_specific_p:
-        cmd.append("--state_specific_p")
-    if no_gam:
-        cmd.append("--no_gam")
-    
-    print(f"Executing: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+from smc_unified import load_data, build_model, run_smc
 
-
-def k_selection(dataset=dataset):
-    """Run K-selection sequence."""
-    
-    configs = [
-        # (K, state_specific_p, no_gam, n_cust, draws, description)
-        (1, False, False, 500, 500, "Static Tweedie-GAM, varying p"),
-        (2, True, False, 500, 500, "HMM K=2, state-specific p, GAM"),
-        (3, True, False, 500, 500, "HMM K=3, state-specific p, GAM"),
-        (4, True, False, 500, 500, "HMM K=4, state-specific p, GAM"),
-    ]
-    
-    for K, state_p, no_gam, n_cust, draws, desc in configs:
-        print(f"\n{'='*70}")
-        print(f"Running: {desc}")
-        print(f"{'='*70}")
-        
-        try:
-            run_smc_from_github(
-                dataset=dataset,
-                K=K,
-                n_cust=n_cust,
-                draws=draws,
-                chains=4,
-                state_specific_p=state_p,
-                no_gam=no_gam
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Failed: {e}")
-            continue
-
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Local SMC runner with GitHub fetch')
-    parser.add_argument("--mode", choices=['k_selection', 'single'], default='k_selection')
-    parser.add_argument("--dataset", choices=['uci', 'cdnow'], default='uci')
-    parser.add_argument("--K", type=int, default=3)
-    parser.add_argument("--state_specific_p", action="store_true")
-    parser.add_argument("--n_cust", type=int, default=500)
-    parser.add_argument("--draws", type=int, default=500)
+def main():
+    parser = argparse.ArgumentParser(description='Run SMC for RFM-HMM-Tweedie')
+    parser.add_argument('--dataset', type=str, required=True, 
+                       choices=['uci', 'cdnow', 'UCI', 'CDNOW'],
+                       help='Dataset name (uci or cdnow)')
+    parser.add_argument('-k', '--k', type=int, required=True,
+                       help='Number of states (1 for static)')
+    parser.add_argument('-n', '--n', type=int, default=500,
+                       help='Sample size')
+    parser.add_argument('--draws', type=int, default=500,
+                       help='Number of SMC draws')
+    parser.add_argument('-c', '--cores', type=int, default=4,
+                       help='Number of cores')
+    parser.add_argument('--p', type=float, default=None,
+                       help='Fixed p value (e.g., 1.5). If omitted, estimates p freely.')
+    parser.add_argument('--state-specific-p', action='store_true',
+                       help='Use state-specific p (for K>1 only)')
+    parser.add_argument('--no-gam', action='store_true',
+                       help='Use GLM instead of GAM (linear only)')
     
     args = parser.parse_args()
     
-    if args.mode == 'k_selection':
-        k_selection(dataset=args.dataset)
+    # Prepare paths
+    data_dir = Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/data")
+    results_dir = Path("/Users/sudhirvoleti/research related/HMM n tweedie in RFM Nov 2025/Jan_SMC_Runs/results")
+    results_dir.mkdir(exist_ok=True)
+    
+    # Load data
+    print(f"Loading {args.dataset} data...")
+    df = load_data(args.dataset, data_dir, n=args.n)
+    
+    # Build model
+    print(f"Building model: K={args.k}, GAM={not args.no_gam}, varying_p={args.p is None}")
+    model = build_model(
+        df, 
+        K=args.k,
+        use_gam=not args.no_gam,
+        fixed_p=args.p,
+        state_specific_p=args.state_specific_p and args.k > 1
+    )
+    
+    # Run SMC
+    print(f"Running SMC with {args.draws} draws, {args.cores} cores...")
+    idata = run_smc(model, draws=args.draws, cores=args.cores)
+    
+    # CRITICAL FIX: Include dataset name in filename
+    dataset_prefix = args.dataset.lower()
+    k_str = f"K{args.k}"
+    
+    if args.state_specific_p and args.k > 1:
+        p_str = "statep"
+    elif args.p is not None:
+        p_str = f"fixedp{args.p:.2f}".replace('.', '')
     else:
-        run_smc_from_github(
-            dataset=args.dataset,
-            K=args.K,
-            n_cust=args.n_cust,
-            draws=args.draws,
-            chains=4,
-            state_specific_p=args.state_specific_p
-        )
+        p_str = "varyingp"
+    
+    model_str = "GLM" if args.no_gam else "GAM"
+    
+    filename = f"smc_{dataset_prefix}_{k_str}_{model_str}_{p_str}_N{args.n}_D{args.draws}_C{args.cores}.pkl"
+    output_path = results_dir / filename
+    
+    # Save
+    with open(output_path, 'wb') as f:
+        pickle.dump(idata, f)
+    
+    print(f"\nSaved to: {output_path}")
+    
+    # Quick summary
+    if hasattr(idata, 'sample_stats') and 'log_evidence' in idata.sample_stats:
+        log_ev = float(idata.sample_stats['log_evidence'].mean())
+        print(f"Log-evidence: {log_ev:.2f}")
+    
+    if hasattr(idata, 'posterior') and 'p' in idata.posterior:
+        p_post = idata.posterior['p']
+        p_mean = p_post.mean(dim=['chain', 'draw'])
+        if p_mean.ndim > 0 and len(p_mean.shape) > 0:
+            print(f"State-p estimates: {p_mean.values}")
+        else:
+            print(f"Global p estimate: {float(p_mean.values):.3f}")
+
+if __name__ == "__main__":
+    main()

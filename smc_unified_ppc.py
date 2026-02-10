@@ -215,32 +215,33 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
         clv_proxy = pm.Deterministic('clv_proxy', pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
         
-        # ---- ZIG emission ----
+        # ---- ZIG emission with free psi parameter ----
+        # Free zero-inflation probability (not derived from mu/phi/p)
         if K == 1:
-            p_expanded = p
+            psi_raw = pm.Beta('psi_raw', alpha=2, beta=2)
+            psi = pm.Deterministic('psi', 0.5 + 0.5 * psi_raw)  # [0.5, 1]
+        else:
+            psi_raw = pm.Beta('psi_raw', alpha=2, beta=2, shape=K)
+            psi_sorted = pt.sort(psi_raw)  # increasing with state
+            psi = pm.Deterministic('psi', 0.5 + 0.5 * psi_sorted)  # [0.5, 1]
+        
+        if K == 1:
             phi_expanded = phi
-            exponent = 2.0 - p_expanded
             
-            psi = pt.exp(-pt.pow(mu, exponent) / (phi_expanded * exponent))
-            psi = pt.clip(psi, 1e-12, 1 - 1e-12)
-            
-            log_zero = pt.log(psi)
+            log_zero = pt.log(psi + 1e-12)
             log_pos = pt.log1p(-psi) + gamma_logp_det(y, mu, phi_expanded)
             log_emission = pt.where(y == 0, log_zero, log_pos)
             log_emission = pt.where(mask, log_emission, 0.0)
         else:
-            p_expanded = p[None, None, :]
             phi_expanded = phi[None, None, :]
-            exponent = 2.0 - p_expanded
+            psi_expanded = psi[None, None, :]
             
-            psi = pt.exp(-pt.pow(mu, exponent) / (phi_expanded * exponent))
-            psi = pt.clip(psi, 1e-12, 1 - 1e-12)
-            
-            log_zero = pt.log(psi)
+            log_zero = pt.log(psi_expanded + 1e-12)
             y_exp = y[..., None]
-            log_pos = pt.log1p(-psi) + gamma_logp_det(y_exp, mu, phi_expanded)
+            log_pos = pt.log1p(-psi_expanded) + gamma_logp_det(y_exp, mu, phi_expanded)
             log_emission = pt.where(y_exp == 0, log_zero, log_pos)
             log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
+            
 
         # ---- Marginal likelihood ----
         if K == 1:

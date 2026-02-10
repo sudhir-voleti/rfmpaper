@@ -215,32 +215,29 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         beta = pm.Deterministic('beta',
                                 pt.log(gamma_diag + 1e-8) - 
                                 pt.log(1 - gamma_diag + 1e-8),
-                                dims='state')
+                                shape=K)  # Use shape not dims
         
         # Delta: Dissipation from Recency smooth coefficients
-        # Measures sensitivity to recency decay
         if use_gam and 'w_R' in locals():
             # Average absolute spline weight as dissipation proxy
             delta = pm.Deterministic('delta',
                                     pt.mean(pt.abs(w_R), axis=-1),
-                                    dims='state')
+                                    shape=K)  # Use shape not dims
         else:
             # Placeholder for GLM case (constant dissipation)
             delta = pm.Deterministic('delta',
                                     pt.ones(K) * 0.5,
-                                    dims='state')
+                                    shape=K)  # Use shape not dims
         
         # ROI Metric: CLV Proxy for counterfactual analysis
-        # Simplified CLV = mean_spend / (1 - discount * persistence)
-        # Tracks per-state value for resurrection strategy calculations
         if K > 1:
             clv_proxy = pm.Deterministic('clv_proxy',
                                         pt.exp(beta0) / (1 - 0.95 * gamma_diag),
-                                        dims='state')
+                                        shape=K)  # Use shape not dims
             # Churn risk (1 - persistence) for targeting
             churn_risk = pm.Deterministic('churn_risk',
                                          1 - gamma_diag,
-                                         dims='state')
+                                         shape=K)  # Use shape not dims
         else:
             # K=1 static case
             clv_proxy = pm.Deterministic('clv_proxy',
@@ -248,7 +245,8 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
             churn_risk = pm.Deterministic('churn_risk',
                                          1 - gamma_diag)
         
-        # ---- ZIG emission ----
+        # ---- ZIG emission ----       
+
         if K == 1:
             p_expanded = p
             phi_expanded = phi

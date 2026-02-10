@@ -259,9 +259,6 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         f_elasticity = pm.Deterministic('f_elasticity', f_elast)
         m_elasticity = pm.Deterministic('m_elasticity', m_elast)
         
-        # Debug: verify deterministics are in the model
-        print(f"Model deterministics: {list(model.deterministics.keys())}")
-        
         # ---- ZIG emission ----
         if K == 1:
             p_expanded = p

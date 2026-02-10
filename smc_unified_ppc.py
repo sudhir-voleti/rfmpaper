@@ -267,13 +267,20 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 # 4. DATA BUILDER
 # =============================================================================
 
-def build_panel_data(df_path, customer_col='customer_id', n_cust=None, seed=RANDOM_SEED):
+def build_panel_data(df_path, customer_col='customer_id', n_cust=None, 
+                     max_week=None, seed=42):  # ADD max_week
     """Build panel data dictionary from CSV with float32 optimization."""
     np.random.seed(seed)
     
     df = pd.read_csv(df_path, parse_dates=['WeekStart'])
     df = df.astype({customer_col: str})
-    
+
+    # ADD THIS BLOCK
+    if max_week is not None:
+        df['WeekIndex'] = df.groupby(customer_col)['WeekStart'].rank(method='dense').astype(int)
+        df = df[df['WeekIndex'] <= max_week]
+        print(f"Filtered to weeks 1-{max_week}: {len(df)} rows")
+        
     if n_cust is not None:
         unique_custs = df[customer_col].unique()
         if len(unique_custs) > n_cust:
@@ -428,6 +435,8 @@ def main():
     parser.add_argument('--chains', type=int, default=4)
     parser.add_argument('--out_dir', type=str, default='./results')
     parser.add_argument('--seed', type=int, default=RANDOM_SEED)
+    parser.add_argument('--max_week', type=int, default=None,
+                   help='Maximum week to include (for train/test split)')
     
     args = parser.parse_args()
     
@@ -444,7 +453,9 @@ def main():
     print(f"FloatX: {pytensor.config.floatX}, Optimizer: {pytensor.config.optimizer}")
     print(f"{'='*70}\n")
     
-    data = build_panel_data(data_path, n_cust=args.n_cust, seed=args.seed)
+    data = build_panel_data(data_path, n_cust=args.n_cust, 
+                       max_week=args.max_week,  # ADD
+                       seed=args.seed)
     print(f"Loaded: N={data['N']}, T={data['T']}, zeros={np.mean(data['y']==0):.1%}\n")
     
     pkl_path, res = run_smc(

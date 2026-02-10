@@ -17,6 +17,7 @@ os.environ['PYTENSOR_FLAGS'] = 'floatX=float32,optimizer=fast_run,openmp=True'
 # Now import pytensor - it will read the flags
 import pytensor
 import numpy as np
+import pytensor.tensor as pt
 
 # Verify config
 print(f"PyTensor config: floatX={pytensor.config.floatX}, optimizer={pytensor.config.optimizer}")
@@ -208,9 +209,6 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         mu = pt.clip(mu, 1e-3, 1e6)
 
         # ---- Kinetic Parameters & ROI Metrics (Deterministic) ----
-        # Import pytensor.tensor for diagonal extraction
-        import pytensor.tensor as pt
-        
         # Beta: Persistence log-odds (kinetic momentum parameter)
         # Shape: (K,) for state-specific persistence
         gamma_diag = pt.diag(Gamma)  # Extract diagonal (self-transition probs)

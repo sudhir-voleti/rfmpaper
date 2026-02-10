@@ -207,6 +207,46 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         mu = pt.clip(mu, 1e-3, 1e6)
 
+        # ---- Kinetic Parameters & ROI Metrics (Deterministic) ----
+        # Beta: Persistence log-odds (kinetic momentum parameter)
+        # Shape: (K,) for state-specific persistence
+        gamma_diag = pm.math.diag(Gamma)  # Extract diagonal (self-transition probs)
+        beta = pm.Deterministic('beta',
+                                pm.math.log(gamma_diag + 1e-8) - 
+                                pm.math.log(1 - gamma_diag + 1e-8),
+                                dims='state')
+        
+        # Delta: Dissipation from Recency smooth coefficients
+        # Measures sensitivity to recency decay
+        if use_gam and 'w_R' in locals():
+            # Average absolute spline weight as dissipation proxy
+            delta = pm.Deterministic('delta',
+                                    pm.math.mean(pm.math.abs(w_R), axis=-1),
+                                    dims='state')
+        else:
+            # Placeholder for GLM case (constant dissipation)
+            delta = pm.Deterministic('delta',
+                                    pm.math.ones(K) * 0.5,
+                                    dims='state')
+        
+        # ROI Metric: CLV Proxy for counterfactual analysis
+        # Simplified CLV = mean_spend / (1 - discount * persistence)
+        # Tracks per-state value for resurrection strategy calculations
+        if K > 1:
+            clv_proxy = pm.Deterministic('clv_proxy',
+                                        pm.math.exp(beta0) / (1 - 0.95 * gamma_diag),
+                                        dims='state')
+            # Churn risk (1 - persistence) for targeting
+            churn_risk = pm.Deterministic('churn_risk',
+                                         1 - gamma_diag,
+                                         dims='state')
+        else:
+            # K=1 static case
+            clv_proxy = pm.Deterministic('clv_proxy',
+                                        pm.math.exp(beta0) / (1 - 0.95 * gamma_diag))
+            churn_risk = pm.Deterministic('churn_risk',
+                                         1 - gamma_diag)
+        
         # ---- ZIG emission ----
         if K == 1:
             p_expanded = p

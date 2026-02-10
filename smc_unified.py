@@ -212,18 +212,21 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         gamma_diag = pt.diag(Gamma)
         
         # 1. Churn risk (probability of leaving state)
-        churn_risk = pm.Deterministic('churn_risk', 1 - gamma_diag)
+        churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
         
         # 2. Stationary population shares (long-run state proportions)
         if K > 1:
-            # Solve pi_inf = pi_inf * Gamma via power method approximation
-            # Add small constant to ensure invertibility
-            pi_inf = pm.Deterministic('pi_inf',
-                                      pt.linalg.solve(pt.eye(K) - Gamma.T + 1.0/K,
-                                                     pt.ones(K, dtype='float32')/K))
+            # Power method approximation for stationary distribution
+            # pi_inf = pi_inf @ Gamma, with normalization
+            # Use matrix solve: pi_inf (I - Gamma + 1/K) = 1/K
+            pi_inf_raw = pt.linalg.solve(pt.eye(K) - Gamma.T + 1.0/K, 
+                                         pt.ones(K, dtype='float32')/K)
+            pi_inf = pm.Deterministic('pi_inf', pi_inf_raw / pt.sum(pi_inf_raw))
+            
             # 3. Expected dwell time (weeks in state before transition)
             dwell_time = pm.Deterministic('dwell_time',
-                                          1.0 / (1 - gamma_diag + 1e-8))
+                                          1.0 / (1.0 - gamma_diag + 1e-8))
+            
             # 4. Resurrection probability (cold state 0 -> any hot state 1+)
             res_prob = pm.Deterministic('resurrection_prob',
                                         pt.sum(Gamma[0, 1:]))
@@ -234,7 +237,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         
         # 5. Simplified CLV proxy (geometric series approximation)
         clv_proxy = pm.Deterministic('clv_proxy',
-                                    pt.exp(beta0) / (1 - 0.95 * gamma_diag))
+                                    pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
         
         # 6. RFM elasticities (average absolute effect sizes)
         if use_gam and K > 1:
@@ -244,8 +247,15 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                                             pt.mean(pt.abs(w_F), axis=-1))
             m_elasticity = pm.Deterministic('m_elasticity',
                                             pt.mean(pt.abs(w_M), axis=-1))
+        elif use_gam and K == 1:
+            r_elasticity = pm.Deterministic('r_elasticity', 
+                                            pt.mean(pt.abs(w_R))[None])
+            f_elasticity = pm.Deterministic('f_elasticity', 
+                                            pt.mean(pt.abs(w_F))[None])
+            m_elasticity = pm.Deterministic('m_elasticity', 
+                                            pt.mean(pt.abs(w_M))[None])
         else:
-            # For GLM or K=1, use absolute coefficients
+            # GLM case - use absolute coefficients
             if K == 1:
                 r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR)[None])
                 f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF)[None])
@@ -254,7 +264,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                 r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR))
                 f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF))
                 m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM))
-
+                
 
         # ---- ZIG emission ----
         if K == 1:

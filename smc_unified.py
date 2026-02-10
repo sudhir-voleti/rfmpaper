@@ -210,43 +210,32 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         # ---- Kinetic Parameters & ROI Metrics (Deterministic) ----
         # Beta: Persistence log-odds (kinetic momentum parameter)
-        # Shape: (K,) for state-specific persistence
-        gamma_diag = pt.diag(Gamma)  # Extract diagonal (self-transition probs)
+        gamma_diag = pt.diag(Gamma)
         beta = pm.Deterministic('beta',
                                 pt.log(gamma_diag + 1e-8) - 
-                                pt.log(1 - gamma_diag + 1e-8),
-                                shape=K)  # Use shape not dims
+                                pt.log(1 - gamma_diag + 1e-8))
         
         # Delta: Dissipation from Recency smooth coefficients
         if use_gam and 'w_R' in locals():
-            # Average absolute spline weight as dissipation proxy
             delta = pm.Deterministic('delta',
-                                    pt.mean(pt.abs(w_R), axis=-1),
-                                    shape=K)  # Use shape not dims
+                                    pt.mean(pt.abs(w_R), axis=-1))
         else:
-            # Placeholder for GLM case (constant dissipation)
             delta = pm.Deterministic('delta',
-                                    pt.ones(K) * 0.5,
-                                    shape=K)  # Use shape not dims
+                                    pt.ones(K) * 0.5)
         
-        # ROI Metric: CLV Proxy for counterfactual analysis
+        # ROI Metric: CLV Proxy
         if K > 1:
             clv_proxy = pm.Deterministic('clv_proxy',
-                                        pt.exp(beta0) / (1 - 0.95 * gamma_diag),
-                                        shape=K)  # Use shape not dims
-            # Churn risk (1 - persistence) for targeting
+                                        pt.exp(beta0) / (1 - 0.95 * gamma_diag))
             churn_risk = pm.Deterministic('churn_risk',
-                                         1 - gamma_diag,
-                                         shape=K)  # Use shape not dims
+                                         1 - gamma_diag)
         else:
-            # K=1 static case
             clv_proxy = pm.Deterministic('clv_proxy',
                                         pt.exp(beta0) / (1 - 0.95 * gamma_diag))
             churn_risk = pm.Deterministic('churn_risk',
                                          1 - gamma_diag)
         
-        # ---- ZIG emission ----       
-
+        # ---- ZIG emission ----
         if K == 1:
             p_expanded = p
             phi_expanded = phi

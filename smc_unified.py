@@ -131,7 +131,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N)}) as model:
+    with pm.Model(coords={"customer": np.arange(N), "state": np.arange(K)}) as model:
         
         # ---- Latent dynamics ----
         if K == 1:
@@ -209,63 +209,65 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         mu = pt.clip(mu, 1e-3, 1e6)
 
         # ---- CLV & Segmentation Metrics (Deterministic) ----
+        # Extract diagonal of Gamma (state persistence probabilities)
         gamma_diag = pt.diag(Gamma)
         
         # 1. Churn risk (probability of leaving state)
-        churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
+        churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag, dims='state')
         
-        # 2. Stationary population shares (long-run state proportions)
+        # 2. Stationary population shares, dwell time, resurrection prob (K>1 only)
         if K > 1:
-            # Power method approximation for stationary distribution
-            # pi_inf = pi_inf @ Gamma, with normalization
-            # Use matrix solve: pi_inf (I - Gamma + 1/K) = 1/K
-            pi_inf_raw = pt.linalg.solve(pt.eye(K) - Gamma.T + 1.0/K, 
-                                         pt.ones(K, dtype='float32')/K)
-            pi_inf = pm.Deterministic('pi_inf', pi_inf_raw / pt.sum(pi_inf_raw))
+            # Stationary distribution: solve (I - Gamma' + 1/K) * pi = 1/K
+            A = pt.eye(K) - Gamma.T + 1.0/K
+            b = pt.ones(K, dtype='float32') / K
+            pi_inf_raw = pt.linalg.solve(A, b)
+            pi_inf_norm = pi_inf_raw / pt.sum(pi_inf_raw)
+            pi_inf = pm.Deterministic('pi_inf', pi_inf_norm, dims='state')
             
-            # 3. Expected dwell time (weeks in state before transition)
-            dwell_time = pm.Deterministic('dwell_time',
-                                          1.0 / (1.0 - gamma_diag + 1e-8))
+            # Expected dwell time: 1 / (exit probability)
+            dwell = 1.0 / (1.0 - gamma_diag + 1e-8)
+            dwell_time = pm.Deterministic('dwell_time', dwell, dims='state')
             
-            # 4. Resurrection probability (cold state 0 -> any hot state 1+)
-            res_prob = pm.Deterministic('resurrection_prob',
-                                        pt.sum(Gamma[0, 1:]))
+            # Resurrection: prob from state 0 to any other state
+            res = pt.sum(Gamma[0, 1:])
+            res_prob = pm.Deterministic('resurrection_prob', res)
         else:
-            pi_inf = pm.Deterministic('pi_inf', pt.ones(1, dtype='float32'))
-            dwell_time = pm.Deterministic('dwell_time', pt.ones(1, dtype='float32') * 999.0)
+            # K=1: degenerate cases
+            pi_inf = pm.Deterministic('pi_inf', pt.ones(1, dtype='float32'), dims='state')
+            dwell_time = pm.Deterministic('dwell_time', pt.ones(1, dtype='float32') * 999.0, dims='state')
             res_prob = pm.Deterministic('resurrection_prob', pt.zeros(1, dtype='float32'))
         
-        # 5. Simplified CLV proxy (geometric series approximation)
-        clv_proxy = pm.Deterministic('clv_proxy',
-                                    pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
+        # 3. CLV proxy: expected discounted spend
+        clv = pt.exp(beta0) / (1.0 - 0.95 * gamma_diag)
+        clv_proxy = pm.Deterministic('clv_proxy', clv, dims='state')
         
-        # 6. RFM elasticities (average absolute effect sizes)
-        if use_gam and K > 1:
-            r_elasticity = pm.Deterministic('r_elasticity',
-                                            pt.mean(pt.abs(w_R), axis=-1))
-            f_elasticity = pm.Deterministic('f_elasticity',
-                                            pt.mean(pt.abs(w_F), axis=-1))
-            m_elasticity = pm.Deterministic('m_elasticity',
-                                            pt.mean(pt.abs(w_M), axis=-1))
-        elif use_gam and K == 1:
-            r_elasticity = pm.Deterministic('r_elasticity', 
-                                            pt.mean(pt.abs(w_R))[None])
-            f_elasticity = pm.Deterministic('f_elasticity', 
-                                            pt.mean(pt.abs(w_F))[None])
-            m_elasticity = pm.Deterministic('m_elasticity', 
-                                            pt.mean(pt.abs(w_M))[None])
-        else:
-            # GLM case - use absolute coefficients
-            if K == 1:
-                r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR)[None])
-                f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF)[None])
-                m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM)[None])
-            else:
-                r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR))
-                f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF))
-                m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM))
-                
-
+        # 4. RFM elasticities (GAM: mean abs spline coefs; GLM: abs coefs)
+        if use_gam:
+            if K > 1:
+                r_elast = pt.mean(pt.abs(w_R), axis=-1)
+                f_elast = pt.mean(pt.abs(w_F), axis=-1)
+                m_elast = pt.mean(pt.abs(w_M), axis=-1)
+            else:  # K==1, GAM
+                r_elast = pt.mean(pt.abs(w_R))[None]
+                f_elast = pt.mean(pt.abs(w_F))[None]
+                m_elast = pt.mean(pt.abs(w_M))[None]
+        else:  # GLM
+            if K > 1:
+                r_elast = pt.abs(betaR)
+                f_elast = pt.abs(betaF)
+                m_elast = pt.abs(betaM)
+            else:  # K==1, GLM
+                r_elast = pt.abs(betaR)[None]
+                f_elast = pt.abs(betaF)[None]
+                m_elast = pt.abs(betaM)[None]
+        
+        r_elasticity = pm.Deterministic('r_elasticity', r_elast, dims='state')
+        f_elasticity = pm.Deterministic('f_elasticity', f_elast, dims='state')
+        m_elasticity = pm.Deterministic('m_elasticity', m_elast, dims='state')
+        
+        # Debug: verify deterministics are in the model
+        print(f"Model deterministics: {list(model.deterministics.keys())}")
+        
         # ---- ZIG emission ----
         if K == 1:
             p_expanded = p

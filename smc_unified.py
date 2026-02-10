@@ -211,33 +211,9 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         # ---- CLV & Segmentation Metrics (Deterministic) ----
         gamma_diag = pt.diag(Gamma)
         
-        # 1. Churn risk
+        # Keep only these two - they work
         churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
-        
-        # 2. CLV proxy
         clv_proxy = pm.Deterministic('clv_proxy', pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
-        
-        # 3. Dwell time (simple, no solve)
-        dwell_time = pm.Deterministic('dwell_time', 1.0 / (1.0 - gamma_diag + 1e-8))
-        
-        # 4. RFM elasticities (simple means)
-        if use_gam:
-            r_elasticity = pm.Deterministic('r_elasticity', pt.mean(pt.abs(w_R), axis=-1))
-            f_elasticity = pm.Deterministic('f_elasticity', pt.mean(pt.abs(w_F), axis=-1))
-            m_elasticity = pm.Deterministic('m_elasticity', pt.mean(pt.abs(w_M), axis=-1))
-        else:
-            r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR))
-            f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF))
-            m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM))
-        
-        # 5. Resurrection prob (simple sum)
-        if K > 1:
-            res_prob = pm.Deterministic('resurrection_prob', pt.sum(Gamma[0, 1:]))
-        else:
-            res_prob = pm.Deterministic('resurrection_prob', pt.zeros(1, dtype='float32'))
-        
-        # 6. Stationary distribution - DEFER to post-processing
-        # (compute from Gamma samples after inference)
         
         # ---- ZIG emission ----
         if K == 1:

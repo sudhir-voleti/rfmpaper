@@ -208,33 +208,54 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         mu = pt.clip(mu, 1e-3, 1e6)
 
-        # ---- Kinetic Parameters & ROI Metrics (Deterministic) ----
-        # Beta: Persistence log-odds (kinetic momentum parameter)
+        # ---- CLV & Segmentation Metrics (Deterministic) ----
         gamma_diag = pt.diag(Gamma)
-        beta = pm.Deterministic('beta',
-                                pt.log(gamma_diag + 1e-8) - 
-                                pt.log(1 - gamma_diag + 1e-8))
         
-        # Delta: Dissipation from Recency smooth coefficients
-        if use_gam and 'w_R' in locals():
-            delta = pm.Deterministic('delta',
-                                    pt.mean(pt.abs(w_R), axis=-1))
-        else:
-            delta = pm.Deterministic('delta',
-                                    pt.ones(K) * 0.5)
+        # 1. Churn risk (probability of leaving state)
+        churn_risk = pm.Deterministic('churn_risk', 1 - gamma_diag)
         
-        # ROI Metric: CLV Proxy
+        # 2. Stationary population shares (long-run state proportions)
         if K > 1:
-            clv_proxy = pm.Deterministic('clv_proxy',
-                                        pt.exp(beta0) / (1 - 0.95 * gamma_diag))
-            churn_risk = pm.Deterministic('churn_risk',
-                                         1 - gamma_diag)
+            # Solve pi_inf = pi_inf * Gamma via power method approximation
+            # Add small constant to ensure invertibility
+            pi_inf = pm.Deterministic('pi_inf',
+                                      pt.linalg.solve(pt.eye(K) - Gamma.T + 1.0/K,
+                                                     pt.ones(K, dtype='float32')/K))
+            # 3. Expected dwell time (weeks in state before transition)
+            dwell_time = pm.Deterministic('dwell_time',
+                                          1.0 / (1 - gamma_diag + 1e-8))
+            # 4. Resurrection probability (cold state 0 -> any hot state 1+)
+            res_prob = pm.Deterministic('resurrection_prob',
+                                        pt.sum(Gamma[0, 1:]))
         else:
-            clv_proxy = pm.Deterministic('clv_proxy',
-                                        pt.exp(beta0) / (1 - 0.95 * gamma_diag))
-            churn_risk = pm.Deterministic('churn_risk',
-                                         1 - gamma_diag)
+            pi_inf = pm.Deterministic('pi_inf', pt.ones(1, dtype='float32'))
+            dwell_time = pm.Deterministic('dwell_time', pt.ones(1, dtype='float32') * 999.0)
+            res_prob = pm.Deterministic('resurrection_prob', pt.zeros(1, dtype='float32'))
         
+        # 5. Simplified CLV proxy (geometric series approximation)
+        clv_proxy = pm.Deterministic('clv_proxy',
+                                    pt.exp(beta0) / (1 - 0.95 * gamma_diag))
+        
+        # 6. RFM elasticities (average absolute effect sizes)
+        if use_gam and K > 1:
+            r_elasticity = pm.Deterministic('r_elasticity',
+                                            pt.mean(pt.abs(w_R), axis=-1))
+            f_elasticity = pm.Deterministic('f_elasticity',
+                                            pt.mean(pt.abs(w_F), axis=-1))
+            m_elasticity = pm.Deterministic('m_elasticity',
+                                            pt.mean(pt.abs(w_M), axis=-1))
+        else:
+            # For GLM or K=1, use absolute coefficients
+            if K == 1:
+                r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR)[None])
+                f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF)[None])
+                m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM)[None])
+            else:
+                r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR))
+                f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF))
+                m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM))
+
+
         # ---- ZIG emission ----
         if K == 1:
             p_expanded = p

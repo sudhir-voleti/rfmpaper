@@ -214,50 +214,30 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         # 1. Churn risk
         churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
         
-        # 2. Stationary distribution, dwell time, resurrection (K>1 only)
-        if K > 1:
-            # Stationary: solve (I - Gamma.T + 1/K) * pi = 1/K
-            A = pt.eye(K) - Gamma.T + 1.0/K
-            b = pt.ones(K, dtype='float32') / K
-            pi_inf_raw = pt.linalg.solve(A, b)
-            pi_inf = pm.Deterministic('pi_inf', pi_inf_raw / pt.sum(pi_inf_raw))
-            
-            # Dwell time
-            dwell_time = pm.Deterministic('dwell_time', 1.0 / (1.0 - gamma_diag + 1e-8))
-            
-            # Resurrection prob
-            res_prob = pm.Deterministic('resurrection_prob', pt.sum(Gamma[0, 1:]))
-        else:
-            pi_inf = pm.Deterministic('pi_inf', pt.ones(1, dtype='float32'))
-            dwell_time = pm.Deterministic('dwell_time', pt.ones(1, dtype='float32') * 999.0)
-            res_prob = pm.Deterministic('resurrection_prob', pt.zeros(1, dtype='float32'))
-        
-        # 3. CLV proxy
+        # 2. CLV proxy
         clv_proxy = pm.Deterministic('clv_proxy', pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
         
-        # 4. RFM elasticities
-        if use_gam:
-            if K > 1:
-                r_elast = pt.mean(pt.abs(w_R), axis=-1)
-                f_elast = pt.mean(pt.abs(w_F), axis=-1)
-                m_elast = pt.mean(pt.abs(w_M), axis=-1)
-            else:
-                r_elast = pt.stack([pt.mean(pt.abs(w_R))])
-                f_elast = pt.stack([pt.mean(pt.abs(w_F))])
-                m_elast = pt.stack([pt.mean(pt.abs(w_M))])
-        else:
-            if K > 1:
-                r_elast = pt.abs(betaR)
-                f_elast = pt.abs(betaF)
-                m_elast = pt.abs(betaM)
-            else:
-                r_elast = pt.stack([pt.abs(betaR)])
-                f_elast = pt.stack([pt.abs(betaF)])
-                m_elast = pt.stack([pt.abs(betaM)])
+        # 3. Dwell time (simple, no solve)
+        dwell_time = pm.Deterministic('dwell_time', 1.0 / (1.0 - gamma_diag + 1e-8))
         
-        r_elasticity = pm.Deterministic('r_elasticity', r_elast)
-        f_elasticity = pm.Deterministic('f_elasticity', f_elast)
-        m_elasticity = pm.Deterministic('m_elasticity', m_elast)
+        # 4. RFM elasticities (simple means)
+        if use_gam:
+            r_elasticity = pm.Deterministic('r_elasticity', pt.mean(pt.abs(w_R), axis=-1))
+            f_elasticity = pm.Deterministic('f_elasticity', pt.mean(pt.abs(w_F), axis=-1))
+            m_elasticity = pm.Deterministic('m_elasticity', pt.mean(pt.abs(w_M), axis=-1))
+        else:
+            r_elasticity = pm.Deterministic('r_elasticity', pt.abs(betaR))
+            f_elasticity = pm.Deterministic('f_elasticity', pt.abs(betaF))
+            m_elasticity = pm.Deterministic('m_elasticity', pt.abs(betaM))
+        
+        # 5. Resurrection prob (simple sum)
+        if K > 1:
+            res_prob = pm.Deterministic('resurrection_prob', pt.sum(Gamma[0, 1:]))
+        else:
+            res_prob = pm.Deterministic('resurrection_prob', pt.zeros(1, dtype='float32'))
+        
+        # 6. Stationary distribution - DEFER to post-processing
+        # (compute from Gamma samples after inference)
         
         # ---- ZIG emission ----
         if K == 1:

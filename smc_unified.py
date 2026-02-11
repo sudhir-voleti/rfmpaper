@@ -378,7 +378,7 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
         elapsed = (time.time() - t0) / 60
         
         res = {
-            'dataset': args.dataset,
+            'dataset': dataset,
             'K': K,
             'N': data['N'],
             'T': data['T'],
@@ -399,7 +399,7 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
                 "varyingp" if K == 1 else f"p{p_fixed}"
         
         # ADD DATASET TO FILENAME
-        pkl_path = out_dir / f"smc_{args.dataset}_{model_tag}_{p_tag}_N{data['N']}_D{draws}_C{chains}.pkl"
+        pkl_path = out_dir / f"smc_{dataset}_{model_tag}_{p_tag}_N{data['N']}_D{draws}_C{chains}.pkl"
         
         with open(pkl_path, 'wb') as f:
             pickle.dump({'idata': idata, 'res': res}, f, protocol=4)

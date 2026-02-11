@@ -81,6 +81,7 @@ def reactivation_counterfactual(Gamma, beta0, phi, psi,
     """
     ROI of forcing transition from_state -> to_state at switch_week.
     """
+    K = Gamma.shape[0]  # <-- ADD THIS LINE
     baseline = []
     treatment = []
     
@@ -114,7 +115,6 @@ def reactivation_counterfactual(Gamma, beta0, phi, psi,
         treatment.append(clv_treat)
     
     return np.array(baseline), np.array(treatment)
-
 
 # =============================================================================
 # EXTRACTION PIPELINE

@@ -315,7 +315,7 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None,
 # =============================================================================
 
 def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df, 
-            draws, chains, seed, out_dir):
+            draws, chains, dataset, seed, out_dir):
     """Run SMC estimation with Apple Silicon optimizations."""
     cores = min(chains, os.cpu_count() or 1)
     t0 = time.time()
@@ -469,6 +469,7 @@ def main():
         gam_df=args.gam_df,
         draws=args.draws,
         chains=args.chains,
+        dataset=args.dataset,
         seed=args.seed,
         out_dir=out_dir
     )

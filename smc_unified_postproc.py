@@ -299,54 +299,76 @@ def extract_roi_table(idata, n_sims=2000):
 
 def main():
     parser = argparse.ArgumentParser(description='Post-process SMC results')
-    parser.add_argument('pkl_path', help='Path to .pkl file')
-    parser.add_argument('--output', choices=['state', 'clv', 'roi', 'all'], 
-                       default='all', help='What to extract')
-    parser.add_argument('--n_sims', type=int, default=2000, help='CLV simulations')
+    parser.add_argument('input_path', help='Path to .pkl file OR directory containing .pkl files')
     parser.add_argument('--step', choices=['state', 'clv', 'roi', 'ablation', 'all'], 
-                   default='all', help='Which extraction step')
+                       default='all', help='Which extraction step')
+    parser.add_argument('--n_sims', type=int, default=2000, help='CLV simulations')
+    
     args = parser.parse_args()
     
-    print(f"Loading: {args.pkl_path}")
-    idata, res = load_idata(args.pkl_path)
+    input_path = Path(args.input_path)
     
-    print(f"Dataset: K={res['K']}, N={res['N']}, log_ev={res['log_evidence']:.2f}")
+    # ABILATION MODE: Directory containing multiple .pkl files
+    if args.step == 'ablation':
+        if input_path.is_dir():
+            pkl_files = list(input_path.glob("*.pkl"))
+            output_csv = input_path / 'ablation_table.csv'
+        else:
+            # Single file provided, use its parent directory
+            pkl_files = list(input_path.parent.glob("*.pkl"))
+            output_csv = input_path.parent / 'ablation_table.csv'
+        
+        print(f"Ablation mode: Found {len(pkl_files)} .pkl files")
+        
+        df = build_ablation_table(pkl_files, str(output_csv))
+        print("\n" + "="*70)
+        print("ABLATION TABLE")
+        print("="*70)
+        print(df.to_string())
+        print(f"\nSaved: {output_csv}")
+        return
     
-    if args.output in ['state', 'all']:
+    # SINGLE FILE MODE: Process one .pkl file
+    if not input_path.is_file():
+        print(f"Error: {input_path} is not a file. Use --step ablation for directories.")
+        return
+    
+    pkl_path = str(input_path)
+    print(f"Loading: {pkl_path}")
+    idata, res = load_idata(pkl_path)
+    
+    print(f"Dataset: {res.get('dataset', 'unknown')}, K={res['K']}, N={res['N']}, log_ev={res['log_evidence']:.2f}")
+    
+    if args.step in ['state', 'all']:
         print("\n" + "="*70)
         print("STATE PARAMETERS")
         print("="*70)
         df_state = extract_state_table(idata)
         print(df_state.round(3).to_string())
-        df_state.to_csv(args.pkl_path.replace('.pkl', '_state.csv'), index=False)
+        df_state.to_csv(pkl_path.replace('.pkl', '_state.csv'), index=False)
+        print(f"Saved: {pkl_path.replace('.pkl', '_state.csv')}")
     
-    if args.output in ['clv', 'all']:
+    if args.step in ['clv', 'all']:
         print("\n" + "="*70)
         print("CLV BY STARTING STATE")
         print("="*70)
         df_clv = extract_clv_table(idata, n_sims=args.n_sims)
         print(df_clv.round(2).to_string())
-        df_clv.to_csv(args.pkl_path.replace('.pkl', '_clv.csv'), index=False)
+        df_clv.to_csv(pkl_path.replace('.pkl', '_clv.csv'), index=False)
+        print(f"Saved: {pkl_path.replace('.pkl', '_clv.csv')}")
     
-    if args.output in ['roi', 'all']:
+    if args.step in ['roi', 'all']:
         print("\n" + "="*70)
         print("REACTIVATION ROI")
         print("="*70)
         df_roi = extract_roi_table(idata, n_sims=args.n_sims)
         print(df_roi.round(2).to_string())
-        df_roi.to_csv(args.pkl_path.replace('.pkl', '_roi.csv'), index=False)
+        df_roi.to_csv(pkl_path.replace('.pkl', '_roi.csv'), index=False)
+        print(f"Saved: {pkl_path.replace('.pkl', '_roi.csv')}")
     
-    if args.step == 'ablation':
-        # Glob all files in same directory as pkl_path
-        pkl_dir = Path(args.pkl_path).parent
-        pkl_pattern = str(pkl_dir / "*.pkl")
-        df = build_ablation_table(pkl_pattern, args.pkl_path.replace('.pkl', '_ablation.csv'))
-        print(df.to_string())
-    
-    elif args.step in ['state', 'all']:
-    
-    print(f"\nDone. CSVs saved alongside {args.pkl_path}")
+    print(f"\nDone.")
 
 
 if __name__ == '__main__':
     main()
+    

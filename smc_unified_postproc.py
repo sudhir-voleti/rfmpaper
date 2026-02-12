@@ -44,6 +44,82 @@ def compute_pi_inf(Gamma):
     pi = np.linalg.solve(A, b)
     return pi / pi.sum()
 
+def build_ablation_table(pkl_paths, output_csv=None):
+    """
+    Build model selection table across K for HMM-Tweedie family.
+    pkl_paths: list of paths or glob pattern
+    """
+    if isinstance(pkl_paths, str):
+        pkl_paths = list(Path('.').glob(pkl_paths))
+    
+    rows = []
+    for pkl_path in sorted(pkl_paths):
+        try:
+            idata, res = load_idata(pkl_path)
+            
+            # Compute WAIC if available
+            try:
+                import arviz as az
+                waic = az.waic(idata)
+                waic_val = waic.waic
+                waic_se = waic.waic_se
+            except:
+                waic_val = np.nan
+                waic_se = np.nan
+            
+            row = {
+                'file': Path(pkl_path).name,
+                'dataset': res.get('dataset', 'unknown'),
+                'K': res['K'],
+                'model': 'GAM' if res['use_gam'] else 'GLM',
+                'state_specific_p': res.get('state_specific_p', False),
+                'N': res['N'],
+                'draws': res['draws'],
+                'log_evidence': res['log_evidence'],
+                'waic': waic_val,
+                'waic_se': waic_se,
+                'time_min': res['time_min']
+            }
+            rows.append(row)
+        except Exception as e:
+            print(f"Skipping {pkl_path}: {e}")
+    
+    df = pd.DataFrame(rows)
+    
+    # Compute delta vs K=1 (GAM) for each dataset
+    for dataset in df['dataset'].unique():
+        mask = df['dataset'] == dataset
+        k1_gam = df.loc[mask & (df['K'] == 1) & (df['model'] == 'GAM'), 'log_evidence']
+        if len(k1_gam) > 0:
+            baseline = k1_gam.values[0]
+            df.loc[mask, 'delta_vs_k1gam'] = df.loc[mask, 'log_evidence'] - baseline
+    
+    df = df.sort_values(['dataset', 'K', 'model'])
+    
+    if output_csv:
+        df.to_csv(output_csv, index=False)
+        print(f"Saved: {output_csv}")
+    
+    return df
+
+
+def compute_posterior_predictive_metrics(idata, actual_y=None):
+    """
+    Compute in-sample RMSE and R-squared from posterior predictive.
+    Requires actual_y (N, T) to compare.
+    """
+    if actual_y is None:
+        return {'rmse': np.nan, 'r2': np.nan, 'mae': np.nan}
+    
+    # Posterior predictive mean
+    log_lik = idata.posterior['log_likelihood'].values  # (chains, draws, N)
+    
+    # Reconstruct y_pred from log_lik (approximate)
+    # Better: sample from posterior predictive distribution
+    # For now, return NaN - requires full posterior predictive sampling
+    
+    return {'rmse': np.nan, 'r2': np.nan, 'mae': np.nan}
+    
 
 def simulate_clv(Gamma, beta0, phi, psi, start_state, 
                  horizon=52, discount=0.0019, n_sims=1000):
@@ -227,7 +303,8 @@ def main():
     parser.add_argument('--output', choices=['state', 'clv', 'roi', 'all'], 
                        default='all', help='What to extract')
     parser.add_argument('--n_sims', type=int, default=2000, help='CLV simulations')
-    
+    parser.add_argument('--step', choices=['state', 'clv', 'roi', 'ablation', 'all'], 
+                   default='all', help='Which extraction step')
     args = parser.parse_args()
     
     print(f"Loading: {args.pkl_path}")
@@ -258,6 +335,15 @@ def main():
         df_roi = extract_roi_table(idata, n_sims=args.n_sims)
         print(df_roi.round(2).to_string())
         df_roi.to_csv(args.pkl_path.replace('.pkl', '_roi.csv'), index=False)
+    
+    if args.step == 'ablation':
+        # Glob all files in same directory as pkl_path
+        pkl_dir = Path(args.pkl_path).parent
+        pkl_pattern = str(pkl_dir / "*.pkl")
+        df = build_ablation_table(pkl_pattern, args.pkl_path.replace('.pkl', '_ablation.csv'))
+        print(df.to_string())
+    
+    elif args.step in ['state', 'all']:
     
     print(f"\nDone. CSVs saved alongside {args.pkl_path}")
 

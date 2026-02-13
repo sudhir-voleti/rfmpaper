@@ -139,7 +139,8 @@ def nbd_logp(y, mu, theta):
 # =============================================================================
 
 def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, 
-               use_gam=True, gam_df=3, emission_type='tweedie'):
+               use_gam=True, gam_df=3, emission_type='tweedie'
+               p_min=None, p_max=None):
     """
     Build HMM-Tweedie (K>=2) or Static Tweedie (K=1) model.
     Build HMM with selectable emission: 'tweedie', 'poisson', or 'nbd'.
@@ -226,6 +227,15 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         else:
             p = pt.as_tensor_variable(np.array([p_fixed] * K, dtype=np.float32))
 
+      # Power parameter p
+    if p_min is not None and p_max is not None:
+        # Constrained varying p
+        p_raw = pm.Beta("p_raw", alpha=2, beta=2)
+        p = pm.Deterministic("p", p_min + p_raw * (p_max - p_min))
+    elif K == 1:
+        p_raw = pm.Beta("p_raw", alpha=2, beta=2)
+        p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
+        
         # ---- Compute mu ----
         if use_gam:
             if K == 1:
@@ -517,6 +527,8 @@ def main():
                    help='Maximum week to include (for train/test split)')
     parser.add_argument('--emission', type=str, default='tweedie',
                    choices=['tweedie', 'poisson', 'nbd'])
+    parser.add_argument('--p_min', type=float, default=None)
+    parser.add_argument('--p_max', type=float, default=None)
     
     args = parser.parse_args()
     
@@ -550,7 +562,9 @@ def main():
         dataset=args.dataset,
         seed=args.seed,
         out_dir=out_dir,
-        emission_type=args.emission
+        emission_type=args.emission,
+        p_min=args.p_min,
+        p_max=args.p_max
     )
     
     print(f"\n{'='*70}")

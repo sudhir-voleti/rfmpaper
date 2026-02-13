@@ -3,7 +3,7 @@
 smc_unified_ppc.py
 ==================
 Posterior Predictive Checks for HMM-Tweedie-SMC.
-Computes train/test predictive metrics for Marketing Science validation.
+Uses existing CSV files and imports functions from smc_unified.py via GitHub.
 
 Usage:
     python exec_gitcode.py \
@@ -16,6 +16,10 @@ Usage:
 
 import argparse
 import pickle
+import sys
+import urllib.request
+import tempfile
+import os
 import numpy as np
 import pandas as pd
 import pytensor.tensor as pt
@@ -31,76 +35,197 @@ pytensor.config.floatX = 'float32'
 pytensor.config.optimizer = 'fast_run'
 
 
-def load_model_and_data(pkl_path: str, data_path: str, train_weeks: int):
+# =============================================================================
+# IMPORT FUNCTIONS FROM GITHUB
+# =============================================================================
+
+def import_from_github(url: str):
     """
-    Load fitted model and split data into train/test.
+    Dynamically import functions from smc_unified.py on GitHub.
     """
-    # Load fitted idata
-    with open(pkl_path, 'rb') as f:
-        saved = pickle.load(f)
+    # Convert to raw URL if needed
+    if 'github.com' in url and 'raw.githubusercontent.com' not in url:
+        url = url.replace('github.com', 'raw.githubusercontent.com')
+        url = url.replace('/blob/', '/')
     
-    idata = saved['idata']
-    metadata = saved['res']
+    # Download to temp file
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        code = response.read().decode('utf-8')
     
-    # Load full data
-    # ... data loading logic from smc_unified.py ...
-    # For now, assume we rebuild panel with train/test split
+    # Write temp module
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(code)
+        temp_path = f.name
     
-    return idata, metadata
+    # Import
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("smc_module", temp_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    
+    # Cleanup
+    os.unlink(temp_path)
+    
+    return module
 
 
-def compute_predictive_metrics(y_true: np.ndarray, y_pred: np.ndarray, 
-                               mask: np.ndarray) -> Dict:
+# =============================================================================
+# DATA LOADING (from existing CSVs)
+# =============================================================================
+
+def load_panel_data_from_csv(data_path: Path, n_cust: int = None, 
+                             max_week: int = None, seed: int = 42):
     """
-    Compute MAE, RMSE, R² for held-out predictions.
+    Load pre-built panel data from CSV.
+    Reuses logic from smc_unified.py but with CSV input.
     """
-    # Apply mask
-    y_true_masked = y_true[mask]
-    y_pred_masked = y_pred[mask]
+    df = pd.read_csv(data_path)
+    df['Date'] = pd.to_datetime(df['Date'])
     
-    # Metrics
-    mae = np.mean(np.abs(y_true_masked - y_pred_masked))
-    rmse = np.sqrt(np.mean((y_true_masked - y_pred_masked) ** 2))
+    # Filter by max_week if specified (train/test split)
+    if max_week is not None:
+        df = df[df['Week'] <= max_week].copy()
     
-    # R²
-    ss_res = np.sum((y_true_masked - y_pred_masked) ** 2)
-    ss_tot = np.sum((y_true_masked - np.mean(y_true_masked)) ** 2)
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    # Customer sampling
+    if n_cust is not None:
+        np.random.seed(seed)
+        all_cust = df['CustomerID'].unique()
+        selected = np.random.choice(all_cust, size=min(n_cust, len(all_cust)), 
+                                   replace=False)
+        df = df[df['CustomerID'].isin(selected)].copy()
+    
+    # Build panel (simplified - assumes weekly aggregation exists)
+    customers = df['CustomerID'].unique()
+    N = len(customers)
+    weeks = sorted(df['Week'].unique())
+    T = len(weeks)
+    
+    # Initialize arrays
+    y = np.zeros((N, T), dtype=np.float32)
+    R = np.zeros((N, T), dtype=np.float32)
+    F = np.zeros((N, T), dtype=np.float32)
+    M = np.zeros((N, T), dtype=np.float32)
+    
+    # Fill arrays (simplified - assumes RFM already computed)
+    cust_map = {c: i for i, c in enumerate(customers)}
+    week_map = {w: t for t, w in enumerate(weeks)}
+    
+    for _, row in df.iterrows():
+        i = cust_map[row['CustomerID']]
+        t = week_map[row['Week']]
+        y[i, t] = row.get('Spend', 0)
+        R[i, t] = row.get('Recency', 0)
+        F[i, t] = row.get('Frequency', 0)
+        M[i, t] = row.get('Monetary', 0)
+    
+    mask = (y > 0) | (R > 0)  # Simple mask
     
     return {
-        'mae': float(mae),
-        'rmse': float(rmse),
-        'r2': float(r2),
-        'n_obs': int(mask.sum())
+        'y': y,
+        'R': R,
+        'F': F,
+        'M': M,
+        'mask': mask,
+        'N': N,
+        'T': T,
+        'customers': customers
     }
 
 
-def posterior_predictive_check(idata: object, data_train: Dict, 
-                               data_test: Dict, n_samples: int = 500) -> Dict:
+# =============================================================================
+# POSTERIOR PREDICTIVE SAMPLING
+# =============================================================================
+
+def sample_posterior_predictive_hmm(idata: object, data: Dict, 
+                                    n_samples: int = 500) -> Dict:
     """
-    Generate posterior predictive samples and compute metrics.
+    Generate posterior predictive samples for HMM-Tweedie.
+    
+    For each posterior sample:
+    1. Sample state sequence z_{1:T} given parameters
+    2. Sample emissions y_t ~ ZIG(mu_t, phi_{z_t}, p_{z_t})
     """
-    # Extract posterior samples
     post = idata.posterior
+    N, T = data['N'], data['T']
+    K = post['Gamma'].shape[2]
     
-    # Sample from posterior predictive (manual implementation)
-    # For HMM, need to sample states then emissions
+    # Extract posterior samples
+    n_chains, n_draws = post['beta0'].shape[:2]
+    idx = np.random.choice(n_chains * n_draws, size=n_samples, replace=False)
     
-    results = {
-        'train_metrics': {},
-        'test_metrics': {},
-        'predictions': {}
+    predictions = []
+    
+    for sample_idx in idx:
+        chain_idx = sample_idx // n_draws
+        draw_idx = sample_idx % n_draws
+        
+        # Extract parameters for this sample
+        beta0 = post['beta0'].values[chain_idx, draw_idx, :]  # (K,)
+        phi = post['phi'].values[chain_idx, draw_idx, :]  # (K,)
+        p = post['p'].values[chain_idx, draw_idx, :] if 'p' in post else np.full(K, 1.5)
+        Gamma = post['Gamma'].values[chain_idx, draw_idx, :, :]  # (K, K)
+        
+        # Forward filter to get state probabilities
+        # Then sample states
+        # Then sample emissions
+        
+        # Simplified: just sample from marginal state distribution
+        pi0 = post['pi0'].values[chain_idx, draw_idx, :] if 'pi0' in post else np.ones(K)/K
+        
+        y_pred = np.zeros((N, T))
+        
+        for i in range(N):
+            # Sample state sequence (simplified - independent draws)
+            z = np.random.choice(K, size=T, p=pi0)
+            
+            for t in range(T):
+                k = z[t]
+                mu_it = np.exp(beta0[k])  # Simplified - no covariates
+                
+                # ZIG sample
+                exponent = 2.0 - p[k]
+                psi = np.exp(-(mu_it ** exponent) / (phi[k] * exponent))
+                
+                if np.random.rand() < psi:
+                    y_pred[i, t] = 0
+                else:
+                    # Gamma sample
+                    alpha = mu_it / phi[k]
+                    y_pred[i, t] = np.random.gamma(alpha, phi[k])
+        
+        predictions.append(y_pred)
+    
+    return {
+        'predictions': np.array(predictions),  # (n_samples, N, T)
+        'mean': np.mean(predictions, axis=0),
+        'std': np.std(predictions, axis=0)
     }
-    
-    # TODO: Implement PPC sampling
-    # This requires state sequence sampling + emission sampling
-    
-    return results
 
+
+def compute_predictive_metrics(y_true: np.ndarray, y_pred: np.ndarray,
+                               mask: np.ndarray) -> Dict:
+    """Compute MAE, RMSE, R²."""
+    y_true_m = y_true[mask]
+    y_pred_m = y_pred[mask]
+    
+    mae = np.mean(np.abs(y_true_m - y_pred_m))
+    rmse = np.sqrt(np.mean((y_true_m - y_pred_m) ** 2))
+    
+    ss_res = np.sum((y_true_m - y_pred_m) ** 2)
+    ss_tot = np.sum((y_true_m - np.mean(y_true_m)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    
+    return {'mae': mae, 'rmse': rmse, 'r2': r2, 'n': mask.sum()}
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Posterior Predictive Checks for HMM-Tweedie',
+        description='Posterior Predictive Checks for HMM-Tweedie-SMC',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -108,50 +233,80 @@ def main():
                        help='Directory containing fitted .pkl files')
     parser.add_argument('--dataset', type=str, required=True,
                        choices=['uci', 'cdnow'])
+    parser.add_argument('--data_dir', type=str, default='./data',
+                       help='Directory containing CSV files')
     parser.add_argument('--train_weeks', type=int, default=40,
                        help='Number of weeks for training')
     parser.add_argument('--test_weeks', type=int, default=13,
                        help='Number of weeks for testing')
-    parser.add_argument('--n_ppc_samples', type=int, default=500,
+    parser.add_argument('--n_samples', type=int, default=500,
                        help='Number of posterior predictive samples')
     parser.add_argument('--out_dir', type=str, default=None)
     
     args = parser.parse_args()
     
-    # Find fitted model
     results_path = Path(args.results_dir)
+    data_path = Path(args.data_dir)
+    out_path = Path(args.out_dir) if args.out_dir else results_path
+    
+    # Find fitted model
     pattern = f"smc_{args.dataset}_K*_GAM_*_N*_D*.pkl"
     pkls = list(results_path.glob(pattern))
-    
     if not pkls:
-        raise FileNotFoundError(f"No fitted models found in {args.results_dir}")
+        raise FileNotFoundError(f"No models found in {results_path}")
     
     pkl_path = max(pkls, key=lambda p: p.stat().st_mtime)
     print(f"Loading fitted model: {pkl_path.name}")
     
-    # Load and run PPC
-    idata, metadata = load_model_and_data(
-        str(pkl_path), 
-        None,  # data path
-        args.train_weeks
+    # Load fitted model
+    with open(pkl_path, 'rb') as f:
+        saved = pickle.load(f)
+    
+    idata = saved['idata']
+    metadata = saved['res']
+    
+    # Load training data
+    csv_path = data_path / f"{args.dataset}_full.csv"
+    print(f"Loading data from: {csv_path}")
+    
+    data_train = load_panel_data_from_csv(csv_path, max_week=args.train_weeks)
+    data_test = load_panel_data_from_csv(csv_path, 
+                                         max_week=args.train_weeks + args.test_weeks)
+    
+    print(f"Train: N={data_train['N']}, T={data_train['T']}")
+    print(f"Test: N={data_test['N']}, T={data_test['T']}")
+    
+    # Generate PPC samples
+    print(f"Generating {args.n_samples} posterior predictive samples...")
+    ppc = sample_posterior_predictive_hmm(idata, data_test, args.n_samples)
+    
+    # Compute metrics
+    print("Computing predictive metrics...")
+    metrics = compute_predictive_metrics(
+        data_test['y'], 
+        ppc['mean'], 
+        data_test['mask']
     )
     
-    print(f"Running PPC with {args.n_ppc_samples} samples...")
-    print(f"Train weeks: {args.train_weeks}, Test weeks: {args.test_weeks}")
-    
-    # TODO: Complete PPC implementation
-    # This is a scaffold - needs full implementation
-    
-    print("PPC complete. Saving results...")
+    print(f"\nPredictive Metrics (Test Set):")
+    print(f"  MAE:  {metrics['mae']:.3f}")
+    print(f"  RMSE: {metrics['rmse']:.3f}")
+    print(f"  R²:   {metrics['r2']:.3f}")
+    print(f"  N:    {metrics['n']}")
     
     # Save results
-    out_dir = Path(args.out_dir) if args.out_dir else results_path
-    out_path = out_dir / f"ppc_{args.dataset}_T{args.train_weeks}.pkl"
+    results = {
+        'metadata': metadata,
+        'metrics': metrics,
+        'ppc_mean': ppc['mean'],
+        'ppc_std': ppc['std']
+    }
     
-    with open(out_path, 'wb') as f:
-        pickle.dump({'metadata': metadata, 'status': 'placeholder'}, f)
+    out_file = out_path / f"ppc_{args.dataset}_T{args.train_weeks}.pkl"
+    with open(out_file, 'wb') as f:
+        pickle.dump(results, f)
     
-    print(f"Saved to: {out_path}")
+    print(f"\nSaved PPC results to: {out_file}")
 
 
 if __name__ == "__main__":

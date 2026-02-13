@@ -95,15 +95,54 @@ def gamma_logp_det(value, mu, phi):
     
     return (alpha - 1) * pt.log(value) - value * beta + alpha * pt.log(beta) - pt.gammaln(alpha)
 
+# =============================================================================
+# EMISSION DENSITY FUNCTIONS
+# =============================================================================
 
+def zig_logp(y, mu, phi, p):
+    """
+    Zero-Inflated Gamma (ZIG) log-density - Tweedie approximation.
+    Returns log emission matrix (N, T, K) or (N, T) for K=1.
+    """
+    exponent = 2.0 - p
+    psi = pt.exp(-pt.pow(mu, exponent) / (phi * exponent))
+    psi = pt.clip(psi, 1e-12, 1 - 1e-12)
+    
+    log_zero = pt.log(psi)
+    log_pos = pt.log1p(-psi) + gamma_logp_det(y, mu, phi)
+    
+    return pt.where(y == 0, log_zero, log_pos)
+
+
+def poisson_logp(y, mu):
+    """
+    Poisson log-density for count data.
+    WARNING: Discretizes continuous spend - for ablation only.
+    """
+    # Round to nearest integer for Poisson (hacky but necessary)
+    y_rounded = pt.round(pt.clip(y, 0, 1e6))
+    return pm.logp(pm.Poisson.dist(mu=mu), y_rounded)
+
+
+def nbd_logp(y, mu, theta):
+    """
+    Negative Binomial log-density.
+    WARNING: Discrete likelihood on continuous data - will explode at high zeros.
+    """
+    # Round for NBD
+    y_rounded = pt.round(pt.clip(y, 0, 1e6))
+    alpha = theta  # PyMC parameterization: alpha = dispersion
+    return pm.logp(pm.NegativeBinomial.dist(mu=mu, alpha=alpha), y_rounded)
+    
 # =============================================================================
 # 3. UNIFIED MODEL BUILDER
 # =============================================================================
 
 def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, 
-               use_gam=True, gam_df=3):
+               use_gam=True, gam_df=3, emission_type='tweedie'):
     """
     Build HMM-Tweedie (K>=2) or Static Tweedie (K=1) model.
+    Build HMM with selectable emission: 'tweedie', 'poisson', or 'nbd'.
     Optimized for Apple Silicon with float32 throughout.
     """
     N, T = data["N"], data["T"]
@@ -215,32 +254,69 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
         clv_proxy = pm.Deterministic('clv_proxy', pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
         
-        # ---- ZIG emission with free psi parameter ----
-        # Free zero-inflation probability (not derived from mu/phi/p)
-        if K == 1:
-            psi_raw = pm.Beta('psi_raw', alpha=2, beta=2)
-            psi = pm.Deterministic('psi', psi_raw)  # [0, 1]
+        # ---- EMISSION DENSITY ----
+        if emission_type == 'tweedie':
+            # ZIG/Tweedie emission
+            if K == 1:
+                p_expanded = p
+                phi_expanded = phi
+                exponent = 2.0 - p_expanded
+                
+                psi = pt.exp(-pt.pow(mu, exponent) / (phi_expanded * exponent))
+                psi = pt.clip(psi, 1e-12, 1 - 1e-12)
+                
+                log_zero = pt.log(psi)
+                log_pos = pt.log1p(-psi) + gamma_logp_det(y, mu, phi_expanded)
+                log_emission = pt.where(y == 0, log_zero, log_pos)
+                log_emission = pt.where(mask, log_emission, 0.0)
+            else:
+                p_expanded = p[None, None, :]
+                phi_expanded = phi[None, None, :]
+                exponent = 2.0 - p_expanded
+                
+                psi = pt.exp(-pt.pow(mu, exponent) / (phi_expanded * exponent))
+                psi = pt.clip(psi, 1e-12, 1 - 1e-12)
+                
+                log_zero = pt.log(psi)
+                y_exp = y[..., None]
+                log_pos = pt.log1p(-psi) + gamma_logp_det(y_exp, mu, phi_expanded)
+                log_emission = pt.where(y_exp == 0, log_zero, log_pos)
+                log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
+                
+        elif emission_type == 'poisson':
+            # Poisson emission - DISCRETE, rounds continuous spend
+            if K == 1:
+                # Round y to nearest integer for Poisson
+                y_rounded = pt.round(pt.clip(y, 0, 1e6))
+                log_emission = pm.logp(pm.Poisson.dist(mu=mu), y_rounded)
+                log_emission = pt.where(mask, log_emission, 0.0)
+            else:
+                y_exp = y[..., None]
+                y_rounded = pt.round(pt.clip(y_exp, 0, 1e6))
+                log_emission = pm.logp(pm.Poisson.dist(mu=mu), y_rounded)
+                log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
+                
+        elif emission_type == 'nbd':
+            # NBD emission - WILL EXPLODE at high zeros
+            # Add dispersion parameter theta for NBD
+            if K == 1:
+                theta_raw = pm.Exponential('theta_raw', lam=1.0)
+                theta = pm.Deterministic('theta', theta_raw)
+                
+                y_rounded = pt.round(pt.clip(y, 0, 1e6))
+                log_emission = pm.logp(pm.NegativeBinomial.dist(mu=mu, alpha=theta), y_rounded)
+                log_emission = pt.where(mask, log_emission, 0.0)
+            else:
+                theta_raw = pm.Exponential('theta_raw', lam=1.0, shape=K)
+                theta = pm.Deterministic('theta', pt.sort(theta_raw))  # ordering
+                
+                y_exp = y[..., None]
+                y_rounded = pt.round(pt.clip(y_exp, 0, 1e6))
+                log_emission = pm.logp(pm.NegativeBinomial.dist(mu=mu, alpha=theta), y_rounded)
+                log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
         else:
-            psi_raw = pm.Beta('psi_raw', alpha=2, beta=2, shape=K)
-            psi_sorted = pt.sort(psi_raw)  # increasing with state
-            psi = pm.Deterministic('psi', psi_sorted)  # [0, 1]
-        
-        if K == 1:
-            phi_expanded = phi
+            raise ValueError(f"Unknown emission_type: {emission_type}")
             
-            log_zero = pt.log(psi + 1e-12)
-            log_pos = pt.log1p(-psi) + gamma_logp_det(y, mu, phi_expanded)
-            log_emission = pt.where(y == 0, log_zero, log_pos)
-            log_emission = pt.where(mask, log_emission, 0.0)
-        else:
-            phi_expanded = phi[None, None, :]
-            psi_expanded = psi[None, None, :]
-            
-            log_zero = pt.log(psi_expanded + 1e-12)
-            y_exp = y[..., None]
-            log_pos = pt.log1p(-psi_expanded) + gamma_logp_det(y_exp, mu, phi_expanded)
-            log_emission = pt.where(y_exp == 0, log_zero, log_pos)
-            log_emission = pt.where(mask[:, :, None], log_emission, 0.0)            
 
         # ---- Marginal likelihood ----
         if K == 1:

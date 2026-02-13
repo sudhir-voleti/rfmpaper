@@ -391,7 +391,7 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None,
 # =============================================================================
 
 def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df, 
-            draws, chains, dataset, seed, out_dir):
+            draws, chains, dataset, seed, out_dir, emission_type='tweedie'):
     """Run SMC estimation with Apple Silicon optimizations."""
     cores = min(chains, os.cpu_count() or 1)
     t0 = time.time()
@@ -401,7 +401,7 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
     
     try:
         with make_model(data, K=K, state_specific_p=state_specific_p, 
-                       p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df) as model:
+                       p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df, emission_type=emission_type) as model:
             
             model_type = "GAM" if use_gam else "GLM"
             p_type = "state-specific" if (state_specific_p and K > 1) else \
@@ -515,6 +515,8 @@ def main():
     parser.add_argument('--seed', type=int, default=RANDOM_SEED)
     parser.add_argument('--max_week', type=int, default=None,
                    help='Maximum week to include (for train/test split)')
+    parser.add_argument('--emission', type=str, default='tweedie',
+                   choices=['tweedie', 'poisson', 'nbd'])
     
     args = parser.parse_args()
     
@@ -547,7 +549,8 @@ def main():
         chains=args.chains,
         dataset=args.dataset,
         seed=args.seed,
-        out_dir=out_dir
+        out_dir=out_dir,
+        emission_type=args.emission
     )
     
     print(f"\n{'='*70}")

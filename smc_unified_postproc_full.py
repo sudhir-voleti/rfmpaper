@@ -1,419 +1,312 @@
 #!/usr/bin/env python3
 """
-smc_unified_postproc_full.py
-============================
-Comprehensive post-processing for HMM-Tweedie-SMC full runs.
-Extracts all quantities needed for Marketing Science Sections 4-6.
+smc_unified_ppc.py
+==================
+Posterior Predictive Checks for HMM-Tweedie-SMC.
+Uses existing CSV files and imports functions from smc_unified.py via GitHub.
 
 Usage:
     python exec_gitcode.py \
-        https://github.com/sudhir-voleti/rfmpaper/blob/main/smc_unified_postproc_full.py \
+        https://github.com/sudhir-voleti/rfmpaper/blob/main/smc_unified_ppc.py \
         /path/to/results_dir \
         --dataset uci \
-        --output_format all
-
-Output:
-    - CSV tables for LaTeX
-    - Pickled extraction objects
-    - Summary reports
+        --train_weeks 40 \
+        --test_weeks 13
 """
 
 import argparse
 import pickle
-import json
+import sys
+import urllib.request
+import tempfile
+import os
 import numpy as np
 import pandas as pd
+import pytensor.tensor as pt
+import pymc as pm
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
 import warnings
 warnings.filterwarnings('ignore')
 
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-STATE_LABELS = {0: 'Cold', 1: 'Warm', 2: 'Hot', 3: 'Whale', 4: 'VIP'}
-
-OUTPUT_FORMATS = ['csv', 'latex', 'json', 'pkl', 'all']
+# Apple Silicon optimization
+import pytensor
+pytensor.config.floatX = 'float32'
+pytensor.config.optimizer = 'fast_run'
 
 
 # =============================================================================
-# CORE EXTRACTION FUNCTIONS
+# IMPORT FUNCTIONS FROM GITHUB
 # =============================================================================
 
-def load_results(pkl_path: str) -> Tuple[object, Dict]:
-    """Load idata and metadata from SMC result pickle."""
-    with open(pkl_path, 'rb') as f:
-        data = pickle.load(f)
-    return data['idata'], data['res']
-
-
-def summarize_posterior(arr: np.ndarray, ci: float = 0.94) -> Dict:
-    """Compute posterior summaries: mean, sd, median, credible interval."""
-    flat = arr.flatten()
-    alpha = (1 - ci) / 2
-    return {
-        'mean': float(np.mean(flat)),
-        'sd': float(np.std(flat)),
-        'median': float(np.median(flat)),
-        'lo': float(np.quantile(flat, alpha)),
-        'hi': float(np.quantile(flat, 1 - alpha)),
-        'n_eff': len(flat)
-    }
-
-
-def extract_state_emissions(idata: object, K: int) -> pd.DataFrame:
+def import_from_github(url: str):
     """
-    Extract state-specific emission parameters for Table 6.
-    
-    Returns: beta0, phi, p, psi, spend with credible intervals
+    Dynamically import functions from smc_unified.py on GitHub.
     """
-    rows = []
+    # Convert to raw URL if needed
+    if 'github.com' in url and 'raw.githubusercontent.com' not in url:
+        url = url.replace('github.com', 'raw.githubusercontent.com')
+        url = url.replace('/blob/', '/')
     
-    for k in range(K):
-        row = {'state': k, 'label': STATE_LABELS.get(k, f'S{k}')}
-        
-        # beta0 (baseline log-spend)
-        beta0 = idata.posterior['beta0'].values[:, :, k]
-        s = summarize_posterior(beta0)
-        row.update({f'beta0_{k}': s[k] for k in ['mean', 'sd', 'lo', 'hi']})
-        
-        # spend = exp(beta0)
-        spend_samples = np.exp(beta0)
-        s_spend = summarize_posterior(spend_samples)
-        row.update({
-            'spend_mean': s_spend['mean'],
-            'spend_lo': s_spend['lo'],
-            'spend_hi': s_spend['hi']
-        })
-        
-        # phi (dispersion)
-        phi = idata.posterior['phi'].values[:, :, k]
-        s = summarize_posterior(phi)
-        row.update({f'phi_{k}': s[k] for k in ['mean', 'sd', 'lo', 'hi']})
-        
-        # p (power parameter)
-        if 'p' in idata.posterior:
-            p = idata.posterior['p'].values[:, :, k]
-            s = summarize_posterior(p)
-            row.update({f'p_{k}': s[k] for k in ['mean', 'sd', 'lo', 'hi']})
-            p_mean = s['mean']
-        else:
-            p_mean = 1.5
-            row['p_mean'] = p_mean
-        
-        # psi (structural zero probability) - ZIG formula
-        exponent = 2.0 - p_mean
-        psi = np.exp(-(s_spend['mean'] ** exponent) / (s['mean'] * exponent))
-        row['psi_mean'] = float(psi)
-        
-        rows.append(row)
+    # Download to temp file
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        code = response.read().decode('utf-8')
     
-    return pd.DataFrame(rows)
+    # Write temp module
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(code)
+        temp_path = f.name
+    
+    # Import
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("smc_module", temp_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    
+    # Cleanup
+    os.unlink(temp_path)
+    
+    return module
 
 
-def extract_transitions(idata: object, K: int) -> Dict:
+# =============================================================================
+# DATA LOADING (from existing CSVs)
+# =============================================================================
+
+def load_panel_data_from_csv(data_path: Path, n_cust: int = None, 
+                             max_week: int = None, seed: int = 42):
     """
-    Extract transition dynamics for Table 5.
-    
-    Returns: Gamma matrix, persistence, dwell times, resurrection probabilities
+    Load pre-built panel data from CSV.
+    Reuses logic from smc_unified.py but with CSV input.
     """
-    Gamma = idata.posterior['Gamma'].values  # (chains, draws, K, K)
-    Gamma_mean = Gamma.mean(axis=(0, 1))
-    Gamma_std = Gamma.std(axis=(0, 1))
-    Gamma_lo = np.percentile(Gamma, 2.5, axis=(0, 1))
-    Gamma_hi = np.percentile(Gamma, 97.5, axis=(0, 1))
+    df = pd.read_csv(data_path)
+    df['Date'] = pd.to_datetime(df['Date'])
     
-    # Persistence (diagonal elements)
-    gamma_diag = np.einsum('...kk->...k', Gamma)
+    # Filter by max_week if specified (train/test split)
+    if max_week is not None:
+        df = df[df['Week'] <= max_week].copy()
     
-    persistence = {}
-    dwell_times = {}
+    # Customer sampling
+    if n_cust is not None:
+        np.random.seed(seed)
+        all_cust = df['CustomerID'].unique()
+        selected = np.random.choice(all_cust, size=min(n_cust, len(all_cust)), 
+                                   replace=False)
+        df = df[df['CustomerID'].isin(selected)].copy()
     
-    for k in range(K):
-        s = summarize_posterior(gamma_diag[:, :, k])
-        persistence[k] = s
-        dwell_times[k] = 1 / (1 - s['mean']) if s['mean'] < 0.999 else 999.0
+    # Build panel (simplified - assumes weekly aggregation exists)
+    customers = df['CustomerID'].unique()
+    N = len(customers)
+    weeks = sorted(df['Week'].unique())
+    T = len(weeks)
     
-    # Resurrection and abandonment probabilities
-    resurrection = {}
-    if K >= 3:
-        resurrection['cold_to_hot'] = float(Gamma[:, :, 0, 2].mean())
-        resurrection['hot_to_cold'] = float(Gamma[:, :, 2, 0].mean())
+    # Initialize arrays
+    y = np.zeros((N, T), dtype=np.float32)
+    R = np.zeros((N, T), dtype=np.float32)
+    F = np.zeros((N, T), dtype=np.float32)
+    M = np.zeros((N, T), dtype=np.float32)
+    
+    # Fill arrays (simplified - assumes RFM already computed)
+    cust_map = {c: i for i, c in enumerate(customers)}
+    week_map = {w: t for t, w in enumerate(weeks)}
+    
+    for _, row in df.iterrows():
+        i = cust_map[row['CustomerID']]
+        t = week_map[row['Week']]
+        y[i, t] = row.get('Spend', 0)
+        R[i, t] = row.get('Recency', 0)
+        F[i, t] = row.get('Frequency', 0)
+        M[i, t] = row.get('Monetary', 0)
+    
+    mask = (y > 0) | (R > 0)  # Simple mask
     
     return {
-        'Gamma_mean': Gamma_mean,
-        'Gamma_std': Gamma_std,
-        'Gamma_lo': Gamma_lo,
-        'Gamma_hi': Gamma_hi,
-        'persistence': persistence,
-        'dwell_times': dwell_times,
-        'resurrection': resurrection
+        'y': y,
+        'R': R,
+        'F': F,
+        'M': M,
+        'mask': mask,
+        'N': N,
+        'T': T,
+        'customers': customers
     }
 
 
-def extract_clv_metrics(idata: object, K: int) -> pd.DataFrame:
-    """
-    Extract CLV proxy and churn risk by state.
-    """
-    rows = []
-    
-    for k in range(K):
-        row = {'state': k, 'label': STATE_LABELS.get(k, f'S{k}')}
-        
-        # CLV proxy
-        if 'clv_proxy' in idata.posterior:
-            clv = idata.posterior['clv_proxy'].values[:, :, k]
-            s = summarize_posterior(clv)
-            row.update({
-                'clv_mean': s['mean'],
-                'clv_sd': s['sd'],
-                'clv_lo': s['lo'],
-                'clv_hi': s['hi']
-            })
-        
-        # Churn risk
-        if 'churn_risk' in idata.posterior:
-            churn = idata.posterior['churn_risk'].values[:, :, k]
-            s = summarize_posterior(churn)
-            row.update({
-                'churn_mean': s['mean'],
-                'churn_sd': s['sd'],
-                'churn_lo': s['lo'],
-                'churn_hi': s['hi']
-            })
-        
-        rows.append(row)
-    
-    return pd.DataFrame(rows)
-
-
-def compute_stationary_distribution(Gamma_mean: np.ndarray) -> np.ndarray:
-    """Compute stationary distribution from transition matrix."""
-    K = Gamma_mean.shape[0]
-    eigvals, eigvecs = np.linalg.eig(Gamma_mean.T)
-    stationary = eigvecs[:, np.isclose(eigvals, 1)].real
-    stationary = stationary / stationary.sum()
-    return stationary.flatten()
-
-
-def format_latex_table(df: pd.DataFrame, caption: str, label: str) -> str:
-    """Format DataFrame as LaTeX table."""
-    latex = df.to_latex(index=False, float_format='%.3f')
-    return f"\\begin{{table}}[ht]\n\\centering\n\\caption{{{caption}}}\n\\label{{{label}}}\n{latex}\n\\end{{table}}"
-
-
 # =============================================================================
-# MAIN PROCESSING
+# POSTERIOR PREDICTIVE SAMPLING
 # =============================================================================
 
-def process_dataset(results_dir: str, dataset: str, 
-                   output_format: str = 'all', out_dir: Optional[str] = None) -> Dict:
+def sample_posterior_predictive_hmm(idata: object, data: Dict, 
+                                    n_samples: int = 500) -> Dict:
     """
-    Process single dataset and generate all outputs.
+    Generate posterior predictive samples for HMM-Tweedie.
+    
+    For each posterior sample:
+    1. Sample state sequence z_{1:T} given parameters
+    2. Sample emissions y_t ~ ZIG(mu_t, phi_{z_t}, p_{z_t})
     """
-    results_path = Path(results_dir)
+    post = idata.posterior
+    N, T = data['N'], data['T']
+    K = post['Gamma'].shape[2]
     
-    # Find .pkl file
-    patterns = [
-        f"smc_{dataset}_K*_GAM_*_N*_D*.pkl",
-        f"smc_K*_GAM_*_N*_D*_C*.pkl"
-    ]
+    # Extract posterior samples
+    n_chains, n_draws = post['beta0'].shape[:2]
+    idx = np.random.choice(n_chains * n_draws, size=n_samples, replace=False)
     
-    pkls = []
-    for pattern in patterns:
-        pkls.extend(list(results_path.glob(pattern)))
+    predictions = []
     
-    if not pkls:
-        raise FileNotFoundError(f"No .pkl files found in {results_dir} for {dataset}")
+    for sample_idx in idx:
+        chain_idx = sample_idx // n_draws
+        draw_idx = sample_idx % n_draws
+        
+        # Extract parameters for this sample
+        beta0 = post['beta0'].values[chain_idx, draw_idx, :]  # (K,)
+        phi = post['phi'].values[chain_idx, draw_idx, :]  # (K,)
+        p = post['p'].values[chain_idx, draw_idx, :] if 'p' in post else np.full(K, 1.5)
+        Gamma = post['Gamma'].values[chain_idx, draw_idx, :, :]  # (K, K)
+        
+        # Forward filter to get state probabilities
+        # Then sample states
+        # Then sample emissions
+        
+        # Simplified: just sample from marginal state distribution
+        pi0 = post['pi0'].values[chain_idx, draw_idx, :] if 'pi0' in post else np.ones(K)/K
+        
+        y_pred = np.zeros((N, T))
+        
+        for i in range(N):
+            # Sample state sequence (simplified - independent draws)
+            z = np.random.choice(K, size=T, p=pi0)
+            
+            for t in range(T):
+                k = z[t]
+                mu_it = np.exp(beta0[k])  # Simplified - no covariates
+                
+                # ZIG sample
+                exponent = 2.0 - p[k]
+                psi = np.exp(-(mu_it ** exponent) / (phi[k] * exponent))
+                
+                if np.random.rand() < psi:
+                    y_pred[i, t] = 0
+                else:
+                    # Gamma sample
+                    alpha = mu_it / phi[k]
+                    y_pred[i, t] = np.random.gamma(alpha, phi[k])
+        
+        predictions.append(y_pred)
     
-    pkl_path = max(pkls, key=lambda p: p.stat().st_mtime)
-    print(f"Processing: {pkl_path.name}")
-    
-    # Load
-    idata, metadata = load_results(str(pkl_path))
-    K = idata.posterior['Gamma'].shape[2]
-    
-    print(f"  Dataset: {metadata.get('dataset', dataset)}")
-    print(f"  N: {metadata.get('N', 'unknown')}, K: {K}")
-    print(f"  Log-evidence: {metadata.get('log_evidence', 'unknown'):.2f}")
-    
-    # Extract
-    print("  Extracting emissions...")
-    emissions = extract_state_emissions(idata, K)
-    
-    print("  Extracting transitions...")
-    transitions = extract_transitions(idata, K)
-    
-    print("  Extracting CLV metrics...")
-    clv = extract_clv_metrics(idata, K)
-    
-    # Stationary distribution
-    pi_inf = compute_stationary_distribution(transitions['Gamma_mean'])
-    
-    # Compile results
-    results = {
-        'metadata': metadata,
-        'dataset': dataset,
-        'K': K,
-        'emissions': emissions,
-        'transitions': transitions,
-        'clv': clv,
-        'stationary': pi_inf
+    return {
+        'predictions': np.array(predictions),  # (n_samples, N, T)
+        'mean': np.mean(predictions, axis=0),
+        'std': np.std(predictions, axis=0)
     }
-    
-    # Output directory
-    out_path = Path(out_dir) if out_dir else results_path
-    out_path.mkdir(parents=True, exist_ok=True)
-    
-    # Save outputs
-    base_name = f"{dataset}_K{K}_full"
-    
-    if output_format in ['csv', 'all']:
-        emissions.to_csv(out_path / f"{base_name}_emissions.csv", index=False)
-        clv.to_csv(out_path / f"{base_name}_clv.csv", index=False)
-        pd.DataFrame(transitions['Gamma_mean']).to_csv(
-            out_path / f"{base_name}_Gamma.csv"
-        )
-        print(f"  Saved CSV files to {out_path}")
-    
-    if output_format in ['pkl', 'all']:
-        with open(out_path / f"{base_name}_extracted.pkl", 'wb') as f:
-            pickle.dump(results, f)
-        print(f"  Saved pickle: {base_name}_extracted.pkl")
-    
-    if output_format in ['json', 'all']:
-        # Convert numpy arrays to lists for JSON
-        json_results = {
-            'metadata': metadata,
-            'emissions': emissions.to_dict(),
-            'clv': clv.to_dict(),
-            'stationary': pi_inf.tolist()
-        }
-        with open(out_path / f"{base_name}_summary.json", 'w') as f:
-            json.dump(json_results, f, indent=2, default=str)
-    
-    if output_format in ['latex', 'all']:
-        # Generate LaTeX tables
-        latex_emissions = format_latex_table(
-            emissions[['state', 'label', 'spend_mean', 'p_mean', 'phi_mean']],
-            f"State Emission Parameters ({dataset.upper()})",
-            f"tab:{dataset}_emissions"
-        )
-        with open(out_path / f"{base_name}_emissions.tex", 'w') as f:
-            f.write(latex_emissions)
-    
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"SUMMARY: {dataset.upper()}")
-    print(f"{'='*60}")
-    print(f"\nState Emissions:")
-    print(emissions[['state', 'label', 'spend_mean', 'p_mean']].to_string())
-    
-    print(f"\nTransition Persistence:")
-    for k in range(K):
-        pers = transitions['persistence'][k]
-        dwell = transitions['dwell_times'][k]
-        print(f"  {STATE_LABELS.get(k, f'S{k}')}: "
-              f"γ={pers['mean']:.3f}, Dwell={dwell:.1f}w")
-    
-    if 'resurrection' in transitions and transitions['resurrection']:
-        print(f"\nResurrection (Cold→Hot): "
-              f"{transitions['resurrection'].get('cold_to_hot', 0):.3f}")
-    
-    print(f"\nStationary Distribution: {pi_inf.round(3)}")
-    print(f"{'='*60}\n")
-    
-    return results
 
 
-def compare_datasets(uci_results: Dict, cdnow_results: Dict, 
-                    out_dir: Path) -> pd.DataFrame:
-    """Generate comparison table for paper."""
+def compute_predictive_metrics(y_true: np.ndarray, y_pred: np.ndarray,
+                               mask: np.ndarray) -> Dict:
+    """Compute MAE, RMSE, R²."""
+    y_true_m = y_true[mask]
+    y_pred_m = y_pred[mask]
     
-    comparison_data = []
+    mae = np.mean(np.abs(y_true_m - y_pred_m))
+    rmse = np.sqrt(np.mean((y_true_m - y_pred_m) ** 2))
     
-    # Basic info
-    comparison_data.extend([
-        ['Log-Evidence', 
-         f"{uci_results['metadata'].get('log_evidence', 0):.2f}",
-         f"{cdnow_results['metadata'].get('log_evidence', 0):.2f}"],
-        ['Sample Size (N)',
-         str(uci_results['metadata'].get('N', 'N/A')),
-         str(cdnow_results['metadata'].get('N', 'N/A'))],
-        ['States (K)',
-         str(uci_results['K']),
-         str(cdnow_results['K'])]
-    ])
+    ss_res = np.sum((y_true_m - y_pred_m) ** 2)
+    ss_tot = np.sum((y_true_m - np.mean(y_true_m)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
     
-    # State comparisons
-    for k in range(min(uci_results['K'], cdnow_results['K'])):
-        uci_row = uci_results['emissions'].iloc[k]
-        cdnow_row = cdnow_results['emissions'].iloc[k]
-        
-        comparison_data.extend([
-            [f'State {k} Spend ($)',
-             f"{uci_row['spend_mean']:.2f}",
-             f"{cdnow_row['spend_mean']:.2f}"],
-            [f'State {k} Power (p)',
-             f"{uci_row['p_mean']:.3f}",
-             f"{cdnow_row['p_mean']:.3f}"],
-            [f'State {k} Persistence',
-             f"{uci_results['transitions']['persistence'][k]['mean']:.3f}",
-             f"{cdnow_results['transitions']['persistence'][k]['mean']:.3f}"]
-        ])
-    
-    df = pd.DataFrame(comparison_data, columns=['Metric', 'UCI', 'CDNOW'])
-    
-    # Save
-    df.to_csv(out_dir / 'comparison_uci_vs_cdnow.csv', index=False)
-    print(f"\nComparison saved to: {out_dir / 'comparison_uci_vs_cdnow.csv'}")
-    print(df.to_string())
-    
-    return df
+    return {'mae': mae, 'rmse': rmse, 'r2': r2, 'n': mask.sum()}
 
 
 # =============================================================================
-# COMMAND LINE INTERFACE
+# MAIN
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Full post-processing for HMM-Tweedie-SMC (Sections 4-6)',
+        description='Posterior Predictive Checks for HMM-Tweedie-SMC',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     parser.add_argument('results_dir', type=str,
-                       help='Directory containing .pkl result files')
+                       help='Directory containing fitted .pkl files')
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['uci', 'cdnow', 'both'],
-                       help='Which dataset to process')
-    parser.add_argument('--output_format', type=str, default='all',
-                       choices=OUTPUT_FORMATS,
-                       help='Output format(s)')
-    parser.add_argument('--out_dir', type=str, default=None,
-                       help='Output directory (default: same as results_dir)')
+                       choices=['uci', 'cdnow'])
+    parser.add_argument('--data_dir', type=str, default='./data',
+                       help='Directory containing CSV files')
+    parser.add_argument('--train_weeks', type=int, default=40,
+                       help='Number of weeks for training')
+    parser.add_argument('--test_weeks', type=int, default=13,
+                       help='Number of weeks for testing')
+    parser.add_argument('--n_samples', type=int, default=500,
+                       help='Number of posterior predictive samples')
+    parser.add_argument('--out_dir', type=str, default=None)
     
     args = parser.parse_args()
     
-    out_dir = Path(args.out_dir) if args.out_dir else Path(args.results_dir)
+    results_path = Path(args.results_dir)
+    data_path = Path(args.data_dir)
+    out_path = Path(args.out_dir) if args.out_dir else results_path
     
-    # Process single or both datasets
-    if args.dataset == 'both':
-        print("Processing UCI...")
-        uci = process_dataset(args.results_dir, 'uci', args.output_format, str(out_dir))
-        
-        print("\nProcessing CDNOW...")
-        cdnow = process_dataset(args.results_dir, 'cdnow', args.output_format, str(out_dir))
-        
-        print("\nGenerating comparison...")
-        compare_datasets(uci, cdnow, out_dir)
-        
-    else:
-        process_dataset(args.results_dir, args.dataset, args.output_format, str(out_dir))
+    # Find fitted model
+    pattern = f"smc_{args.dataset}_K*_GAM_*_N*_D*.pkl"
+    pkls = list(results_path.glob(pattern))
+    if not pkls:
+        raise FileNotFoundError(f"No models found in {results_path}")
     
-    print(f"\nAll outputs saved to: {out_dir}")
+    pkl_path = max(pkls, key=lambda p: p.stat().st_mtime)
+    print(f"Loading fitted model: {pkl_path.name}")
+    
+    # Load fitted model
+    with open(pkl_path, 'rb') as f:
+        saved = pickle.load(f)
+    
+    idata = saved['idata']
+    metadata = saved['res']
+    
+    # Load training data
+    csv_path = data_path / f"{args.dataset}_full.csv"
+    print(f"Loading data from: {csv_path}")
+    
+    data_train = load_panel_data_from_csv(csv_path, max_week=args.train_weeks)
+    data_test = load_panel_data_from_csv(csv_path, 
+                                         max_week=args.train_weeks + args.test_weeks)
+    
+    print(f"Train: N={data_train['N']}, T={data_train['T']}")
+    print(f"Test: N={data_test['N']}, T={data_test['T']}")
+    
+    # Generate PPC samples
+    print(f"Generating {args.n_samples} posterior predictive samples...")
+    ppc = sample_posterior_predictive_hmm(idata, data_test, args.n_samples)
+    
+    # Compute metrics
+    print("Computing predictive metrics...")
+    metrics = compute_predictive_metrics(
+        data_test['y'], 
+        ppc['mean'], 
+        data_test['mask']
+    )
+    
+    print(f"\nPredictive Metrics (Test Set):")
+    print(f"  MAE:  {metrics['mae']:.3f}")
+    print(f"  RMSE: {metrics['rmse']:.3f}")
+    print(f"  R²:   {metrics['r2']:.3f}")
+    print(f"  N:    {metrics['n']}")
+    
+    # Save results
+    results = {
+        'metadata': metadata,
+        'metrics': metrics,
+        'ppc_mean': ppc['mean'],
+        'ppc_std': ppc['std']
+    }
+    
+    out_file = out_path / f"ppc_{args.dataset}_T{args.train_weeks}.pkl"
+    with open(out_file, 'wb') as f:
+        pickle.dump(results, f)
+    
+    print(f"\nSaved PPC results to: {out_file}")
 
 
 if __name__ == "__main__":

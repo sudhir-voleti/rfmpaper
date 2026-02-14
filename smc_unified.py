@@ -140,7 +140,7 @@ def nbd_logp(y, mu, theta):
 
 def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, 
                use_gam=True, gam_df=3, emission_type='tweedie'
-               p_min=None, p_max=None):
+               p_min=None, p_max=None, phi_sort=True):
     """
     Build HMM-Tweedie (K>=2) or Static Tweedie (K=1) model.
     Build HMM with selectable emission: 'tweedie', 'poisson', or 'nbd'.
@@ -188,14 +188,17 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         else:
             beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
             beta0 = pm.Deterministic("beta0", pt.sort(beta0_raw))
-        
+
         if K == 1:
             phi_raw = pm.Exponential("phi_raw", lam=10.0)
             phi = pm.Deterministic("phi", phi_raw)
         else:
             phi_raw = pm.Exponential("phi_raw", lam=10.0, shape=K)
-            phi = pm.Deterministic("phi", pt.sort(phi_raw))
-
+            if phi_sort:
+                phi = pm.Deterministic("phi", pt.sort(phi_raw))
+            else:
+                phi = pm.Deterministic("phi", phi_raw)
+        
         # ---- R, F, M effects ----
         if use_gam:
             if K == 1:
@@ -217,7 +220,11 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                 betaM = pm.Normal("betaM", 0, 1, shape=K)
 
         # ---- Power parameter p ----
-        if K == 1:
+        if p_min is not None and p_max is not None:
+            # Constrained varying p
+            p_raw = pm.Beta("p_raw", alpha=2, beta=2)
+            p = pm.Deterministic("p", p_min + p_raw * (p_max - p_min))
+        elif K == 1:
             p_raw = pm.Beta("p_raw", alpha=2, beta=2)
             p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
         elif state_specific_p:
@@ -226,16 +233,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
             p = pm.Deterministic("p", 1.1 + p_sorted * 0.8)
         else:
             p = pt.as_tensor_variable(np.array([p_fixed] * K, dtype=np.float32))
-
-      # Power parameter p
-    if p_min is not None and p_max is not None:
-        # Constrained varying p
-        p_raw = pm.Beta("p_raw", alpha=2, beta=2)
-        p = pm.Deterministic("p", p_min + p_raw * (p_max - p_min))
-    elif K == 1:
-        p_raw = pm.Beta("p_raw", alpha=2, beta=2)
-        p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
-        
+            
         # ---- Compute mu ----
         if use_gam:
             if K == 1:
@@ -401,7 +399,8 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None,
 # =============================================================================
 
 def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df, 
-            draws, chains, dataset, seed, out_dir, emission_type='tweedie'):
+            draws, chains, dataset, seed, out_dir, emission_type='tweedie',
+           p_min=None, p_max=None, phi_sort=True):
     """Run SMC estimation with Apple Silicon optimizations."""
     cores = min(chains, os.cpu_count() or 1)
     t0 = time.time()
@@ -411,7 +410,8 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
     
     try:
         with make_model(data, K=K, state_specific_p=state_specific_p, 
-                       p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df, emission_type=emission_type) as model:
+                       p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df, emission_type=emission_type,
+                       p_min=p_min, p_max=p_max, phi_sort=phi_sort) as model:
             
             model_type = "GAM" if use_gam else "GLM"
             p_type = "state-specific" if (state_specific_p and K > 1) else \
@@ -529,6 +529,8 @@ def main():
                    choices=['tweedie', 'poisson', 'nbd'])
     parser.add_argument('--p_min', type=float, default=None)
     parser.add_argument('--p_max', type=float, default=None)
+    parser.add_argument('--phi_sort', action='store_true', default=True)
+    parser.add_argument('--no_phi_sort', dest='phi_sort', action='store_false')
     
     args = parser.parse_args()
     
@@ -564,7 +566,8 @@ def main():
         out_dir=out_dir,
         emission_type=args.emission,
         p_min=args.p_min,
-        p_max=args.p_max
+        p_max=args.p_max,
+        phi_sort=args.phi_sort
     )
     
     print(f"\n{'='*70}")

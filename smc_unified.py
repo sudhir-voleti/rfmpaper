@@ -139,7 +139,7 @@ def nbd_logp(y, mu, theta):
 # =============================================================================
 
 def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, 
-               use_gam=True, gam_df=3, emission_type='tweedie'
+               use_gam=True, gam_df=3, emission_type='tweedie',
                p_min=None, p_max=None, phi_sort=True):
     """
     Build HMM-Tweedie (K>=2) or Static Tweedie (K=1) model.

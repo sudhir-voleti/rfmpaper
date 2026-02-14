@@ -221,9 +221,14 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
 
         # ---- Power parameter p ----
         if p_min is not None and p_max is not None:
-            # Constrained varying p
+            # Constrained varying p - shared across states
             p_raw = pm.Beta("p_raw", alpha=2, beta=2)
-            p = pm.Deterministic("p", p_min + p_raw * (p_max - p_min))
+            p_val = p_min + p_raw * (p_max - p_min)
+            if K == 1:
+                p = pm.Deterministic("p", p_val)
+            else:
+                # Expand to all states
+                p = pm.Deterministic("p", pt.stack([p_val] * K))
         elif K == 1:
             p_raw = pm.Beta("p_raw", alpha=2, beta=2)
             p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
@@ -232,8 +237,9 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
             p_sorted = pt.sort(p_raw)
             p = pm.Deterministic("p", 1.1 + p_sorted * 0.8)
         else:
+            # Fixed p for all states
             p = pt.as_tensor_variable(np.array([p_fixed] * K, dtype=np.float32))
-            
+
         # ---- Compute mu ----
         if use_gam:
             if K == 1:
@@ -400,7 +406,8 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None,
 
 def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df, 
             draws, chains, dataset, seed, out_dir, emission_type='tweedie',
-           p_min=None, p_max=None, phi_sort=True):
+            p_min=None, p_max=None, phi_sort=True):
+
     """Run SMC estimation with Apple Silicon optimizations."""
     cores = min(chains, os.cpu_count() or 1)
     t0 = time.time()
@@ -548,15 +555,33 @@ def main():
     print(f"{'='*70}\n")
     
     data = build_panel_data(data_path, n_cust=args.n_cust, 
-                       max_week=args.max_week,  # ADD
+                       max_week=args.max_week,
                        seed=args.seed)
     print(f"Loaded: N={data['N']}, T={data['T']}, zeros={np.mean(data['y']==0):.1%}\n")
+    
+    # Determine p configuration
+    if args.p_min is not None and args.p_max is not None:
+        # Constrained varying p - override state_specific_p and p_fixed
+        state_specific_p = False
+        p_fixed = None
+        p_type_str = f"varying_p[{args.p_min},{args.p_max}]"
+    elif args.state_specific_p:
+        state_specific_p = True
+        p_fixed = None
+        p_type_str = "state-specific"
+    else:
+        state_specific_p = False
+        p_fixed = args.p_fixed
+        p_type_str = f"fixed={args.p_fixed}"
+    
+    print(f"  p configuration: {p_type_str}")
+    print(f"  phi_sort: {args.phi_sort}")
     
     pkl_path, res = run_smc(
         data=data,
         K=args.K,
-        state_specific_p=args.state_specific_p,
-        p_fixed=args.p_fixed,
+        state_specific_p=state_specific_p,
+        p_fixed=p_fixed,
         use_gam=not args.no_gam,
         gam_df=args.gam_df,
         draws=args.draws,

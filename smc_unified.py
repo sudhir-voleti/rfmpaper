@@ -140,7 +140,8 @@ def nbd_logp(y, mu, theta):
 
 def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, 
                use_gam=True, gam_df=3, emission_type='tweedie',
-               p_min=None, p_max=None, phi_sort=True):
+               p_min=None, p_max=None, phi_sort=True,
+               gamma_diag=1.0, shared_phi=False):  # ADD
     """
     Build HMM-Tweedie (K>=2) or Static Tweedie (K=1) model.
     Build HMM with selectable emission: 'tweedie', 'poisson', or 'nbd'.
@@ -179,7 +180,11 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
         else:
             pi0 = pm.Dirichlet("pi0", a=np.ones(K, dtype=np.float32))
-            Gamma = pm.Dirichlet("Gamma", a=np.ones(K, dtype=np.float32), shape=(K, K))
+            # Strong prior on Gamma diagonal (persistence)
+            gamma_prior_diag = gamma_diag  # Adjust: 2=weak, 5=medium, 10=strong
+            gamma_prior_off = 1.0
+            gamma_a = np.eye(K, dtype=np.float32) * (gamma_prior_diag - gamma_prior_off) + gamma_prior_off
+            Gamma = pm.Dirichlet("Gamma", a=gamma_a, shape=(K, K))
 
         # ---- State parameters ----
         if K == 1:
@@ -189,7 +194,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
             beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
             beta0 = pm.Deterministic("beta0", pt.sort(beta0_raw))
 
-        if K == 1:
+        if K == 1 or shared_phi:
             phi_raw = pm.Exponential("phi_raw", lam=10.0)
             phi = pm.Deterministic("phi", phi_raw)
         else:
@@ -198,6 +203,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                 phi = pm.Deterministic("phi", pt.sort(phi_raw))
             else:
                 phi = pm.Deterministic("phi", phi_raw)
+
         
         # ---- R, F, M effects ----
         if use_gam:
@@ -230,8 +236,14 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                 # Expand to all states
                 p = pm.Deterministic("p", pt.stack([p_val] * K))
         elif K == 1:
-            p_raw = pm.Beta("p_raw", alpha=2, beta=2)
-            p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
+            # FIXED BUG: Check p_fixed first, only vary if not specified
+            if p_fixed is not None:
+                # Truly fixed p for K=1
+                p = pt.as_tensor_variable(np.array([p_fixed], dtype=np.float32))
+            else:
+                # Varying p for K=1 (default behavior)
+                p_raw = pm.Beta("p_raw", alpha=2, beta=2)
+                p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
         elif state_specific_p:
             p_raw = pm.Beta("p_raw", alpha=2, beta=2, shape=K)
             p_sorted = pt.sort(p_raw)
@@ -268,7 +280,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
         churn_risk = pm.Deterministic('churn_risk', 1.0 - gamma_diag)
         clv_proxy = pm.Deterministic('clv_proxy', pt.exp(beta0) / (1.0 - 0.95 * gamma_diag))
         
-        # ---- EMISSION DENSITY ----
+         # ---- EMISSION DENSITY ----
         if emission_type == 'tweedie':
             # ZIG/Tweedie emission
             if K == 1:
@@ -285,7 +297,13 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5,
                 log_emission = pt.where(mask, log_emission, 0.0)
             else:
                 p_expanded = p[None, None, :]
-                phi_expanded = phi[None, None, :]
+                # FIX: Handle scalar phi (shared) vs vector phi (state-specific)
+                if shared_phi:
+                    # phi is scalar, will broadcast to (N, T, K) automatically
+                    phi_expanded = phi
+                else:
+                    # phi is vector (K,), need explicit expansion
+                    phi_expanded = phi[None, None, :]
                 exponent = 2.0 - p_expanded
                 
                 psi = pt.exp(-pt.pow(mu, exponent) / (phi_expanded * exponent))
@@ -406,7 +424,9 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None,
 
 def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df, 
             draws, chains, dataset, seed, out_dir, emission_type='tweedie',
-            p_min=None, p_max=None, phi_sort=True):
+            p_min=None, p_max=None, phi_sort=True,
+            gamma_diag=1.0, shared_phi=False):  # ADD
+
 
     """Run SMC estimation with Apple Silicon optimizations."""
     cores = min(chains, os.cpu_count() or 1)
@@ -417,9 +437,10 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
     
     try:
         with make_model(data, K=K, state_specific_p=state_specific_p, 
-                       p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df, emission_type=emission_type,
-                       p_min=p_min, p_max=p_max, phi_sort=phi_sort) as model:
-            
+               p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df, emission_type=emission_type,
+               p_min=p_min, p_max=p_max, phi_sort=phi_sort, 
+               gamma_diag=gamma_diag, shared_phi=shared_phi) as model:
+
             model_type = "GAM" if use_gam else "GLM"
             p_type = "state-specific" if (state_specific_p and K > 1) else \
                      "varying" if K == 1 else f"fixed={p_fixed}"
@@ -488,11 +509,18 @@ def run_smc(data, K, state_specific_p, p_fixed, use_gam, gam_df,
         }
 
         model_tag = f"K{K}_{'GAM' if use_gam else 'GLM'}"
-        p_tag = "statep" if (state_specific_p and K > 1) else \
-                "varyingp" if K == 1 else f"p{p_fixed}"
+        phi_tag = "sharedphi_" if shared_phi and K > 1 else "statespfc_" if K > 1 else ""
+        emission_tag = f"{emission_type}_" if emission_type != 'tweedie' else ""
+        p_tag = emission_tag
+        if state_specific_p and K > 1:
+            p_tag += "statep"
+        elif K == 1:
+            p_tag += "varyingp" if p_fixed is None else f"p{p_fixed}"
+        else:
+            p_tag += f"p{p_fixed}"
         
-        # ADD DATASET TO FILENAME
-        pkl_path = out_dir / f"smc_{dataset}_{model_tag}_{p_tag}_N{data['N']}_D{draws}_C{chains}.pkl"
+        # ADD DATASET TO FILENAME WITH PHI TAG
+        pkl_path = out_dir / f"smc_{dataset}_{model_tag}_{phi_tag}{p_tag}_N{data['N']}_D{draws}_C{chains}.pkl"
         
         with open(pkl_path, 'wb') as f:
             pickle.dump({'idata': idata, 'res': res}, f, protocol=4)
@@ -538,6 +566,10 @@ def main():
     parser.add_argument('--p_max', type=float, default=None)
     parser.add_argument('--phi_sort', action='store_true', default=True)
     parser.add_argument('--no_phi_sort', dest='phi_sort', action='store_false')
+    parser.add_argument('--gamma_diag', type=float, default=1.0, 
+                   help='Prior concentration for Gamma diagonal (1=uniform, 10=strong persistence)')
+    parser.add_argument('--shared_phi', action='store_true', 
+                   help='Use single phi shared across all states (default: state-specific)')
     
     args = parser.parse_args()
     
@@ -592,7 +624,9 @@ def main():
         emission_type=args.emission,
         p_min=args.p_min,
         p_max=args.p_max,
-        phi_sort=args.phi_sort
+        phi_sort=args.phi_sort,
+        gamma_diag=args.gamma_diag,
+        shared_phi=args.shared_phi
     )
     
     print(f"\n{'='*70}")

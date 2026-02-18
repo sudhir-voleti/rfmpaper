@@ -2,14 +2,12 @@
 """
 simulation_generator.py
 =======================
-MIXTURE DGP with Recency-Dependent Churn (Gemini-enhanced)
-Tests structural recovery under misspecification
+Generate synthetic RFM panel data with known ground truth states.
+Supports multiple DGPs: mixture (unimodal) and bimodal.
 
-Key features:
-1. Recency-dependent churn (not fixed 20%)
-2. High-variance Gamma(2, 4) for challenging recovery
-3. Burn-in period (first 5 periods all dead)
-4. Heterogeneous "vibe" activation
+Usage:
+    python simulation_generator.py --dgp mixture --n_customers 50 --n_periods 60
+    python simulation_generator.py --dgp bimodal --n_customers 100 --n_periods 60
 """
 
 import numpy as np
@@ -18,10 +16,23 @@ import pickle
 import argparse
 from datetime import datetime, timedelta
 
+
+def rcompound_poisson_gamma(n, lambda_poisson, shape_gamma, scale_gamma, p=1.2):
+    """Generate Tweedie(p) via compound Poisson-Gamma."""
+    N = np.random.poisson(lambda_poisson, size=n)
+    samples = np.zeros(n)
+    positive_mask = N > 0
+    if np.any(positive_mask):
+        total_components = N[positive_mask].sum()
+        gamma_draws = np.random.gamma(shape=shape_gamma, scale=scale_gamma, size=total_components)
+        indices = np.concatenate([[0], np.cumsum(N[positive_mask])[:-1]])
+        samples[positive_mask] = np.add.reduceat(gamma_draws, indices)
+    return samples
+
+
 def generate_mixed_observations(n, zero_prob=0.70, gamma_shape=2.0, gamma_scale=4.0):
     """
-    HIGH VARIANCE mixture: 70% zeros + 30% Gamma(2, 4)
-    Mean = 8, Variance = 32 (very noisy active state)
+    MIXTURE DGP (unimodal): zero_prob zeros + Gamma(gamma_shape, gamma_scale)
     """
     is_zero = np.random.rand(n) < zero_prob
     result = np.zeros(n)
@@ -30,34 +41,47 @@ def generate_mixed_observations(n, zero_prob=0.70, gamma_shape=2.0, gamma_scale=
         result[~is_zero] = np.random.gamma(gamma_shape, gamma_scale, size=n_positive)
     return result
 
-def generate_mixture_panel(n_customers=500, n_periods=100, 
-                           zero_prob=0.70, gamma_shape=2.0, gamma_scale=4.0,
-                           burn_in=5, seed=42):
+
+def generate_bimodal_observations(n, zero_prob=0.60):
     """
-    GEMINI-ENHANCED mixture panel with recency-dependent churn.
+    BIMODAL DGP (extreme): zero_prob zeros + 50% Gamma(1,1) + 50% Gamma(10,2)
+    Creates massive variance that NBD cannot capture.
+    """
+    is_zero = np.random.rand(n) < zero_prob
+    result = np.zeros(n)
+    n_positive = (~is_zero).sum()
     
-    BAKED-IN FEATURES:
-    1. BURN-IN: First 'burn_in' periods all customers are State 0
-    2. Heterogeneous activation: Logistic "vibe" curve
-    3. RECENCY-DEPENDENT CHURN: P(churn) = 0.20 + 0.02 * days_since_purchase
-    4. High-variance emissions: Gamma(2, 4) when active
-    5. Target: >75% overall zeros, challenging state recovery
+    if n_positive > 0:
+        is_whale = np.random.rand(n_positive) < 0.5
+        result_pos = np.zeros(n_positive)
+        result_pos[is_whale] = np.random.gamma(10, 2, is_whale.sum())  # Whales: mean=20
+        result_pos[~is_whale] = np.random.gamma(1, 1, (~is_whale).sum())  # Low: mean=1
+        result[~is_zero] = result_pos
+    
+    return result
+
+
+def generate_panel(dgp_type='mixture', n_customers=500, n_periods=100, seed=42, **kwargs):
+    """
+    Generate panel with specified DGP type.
+    
+    Parameters:
+    -----------
+    dgp_type : str
+        'mixture' or 'bimodal'
+    n_customers, n_periods, seed : standard
+    **kwargs : passed to observation generator (zero_prob, etc.)
     """
     np.random.seed(seed)
     N, T = n_customers, n_periods
-
-    # BURN-IN: Everyone starts dead for first 'burn_in' periods
-    # Then logistic "vibe" activation
-    time_norm = np.linspace(-8, 0, T - burn_in)  # Very slow ramp
-    p_active_vibe = np.concatenate([
-        np.zeros(burn_in),  # Burn-in: zero activation probability
-        1 / (1 + np.exp(-time_norm))  # Then slow ramp
-    ])
+    
+    # State dynamics (same for both DGPs)
+    burn_in = kwargs.get('burn_in', 5)
+    time_norm = np.linspace(-6, 2, T - burn_in)
+    p_active_vibe = np.concatenate([np.zeros(burn_in), 1 / (1 + np.exp(-time_norm))])
     
     states = np.zeros((N, T), dtype=int)
     obs = np.zeros((N, T))
-    
-    # Track last purchase for recency-dependent churn
     last_purchase = np.full(N, -999)
 
     for t in range(T):
@@ -65,40 +89,27 @@ def generate_mixture_panel(n_customers=500, n_periods=100,
             if t == 0:
                 states[i, t] = 0
             elif states[i, t-1] == 0:
-                # Dead -> Active based on vibe curve
                 states[i, t] = 1 if np.random.rand() < p_active_vibe[t] else 0
                 if states[i, t] == 1:
-                    last_purchase[i] = t  # Just activated
+                    last_purchase[i] = t
             else:
-                # ACTIVE: Recency-dependent churn
-                # Longer since last purchase = higher churn probability
                 days_since = t - last_purchase[i] if last_purchase[i] >= 0 else 0
-                churn_prob = 0.20 + (0.02 * days_since)  # Increases 2% per day
-                churn_prob = min(churn_prob, 0.80)  # Cap at 80%
-                
-                if np.random.rand() < churn_prob:
-                    states[i, t] = 0  # Churn back to dead
-                    # last_purchase stays as is (memory of when they were active)
-                else:
-                    states[i, t] = 1  # Stay active
-                    # Update last_purchase if they bought something this period
-                    # (handled after observation generation)
+                churn_prob = 0.20 + (0.02 * days_since)
+                churn_prob = min(churn_prob, 0.80)
+                states[i, t] = 0 if np.random.rand() < churn_prob else 1
+        
+        # Generate observations based on DGP type
+        active = (states[:, t] == 1)
+        if active.sum() > 0:
+            if dgp_type == 'bimodal':
+                obs[active, t] = generate_bimodal_observations(active.sum(), **kwargs)
+            else:  # mixture
+                obs[active, t] = generate_mixed_observations(active.sum(), **kwargs)
+            
+            positive = obs[:, t] > 0
+            last_purchase[positive] = t
 
-        # Generate observations for this period
-        active_customers = (states[:, t] == 1)
-        n_active = active_customers.sum()
-        if n_active > 0:
-            obs[active_customers, t] = generate_mixed_observations(
-                n=n_active,
-                zero_prob=zero_prob,
-                gamma_shape=gamma_shape,
-                gamma_scale=gamma_scale
-            )
-            # Update last_purchase for those who bought (positive spend)
-            positive_spend = obs[:, t] > 0
-            last_purchase[positive_spend] = t
-
-    # Calculate RFM metrics
+    # RFM metrics
     r_weeks = np.zeros((N, T))
     f_run = np.zeros((N, T))
     m_run = np.zeros((N, T))
@@ -115,12 +126,28 @@ def generate_mixture_panel(n_customers=500, n_periods=100,
             f_run[i, t] = cum_count
             m_run[i, t] = cum_spend / cum_count if cum_count > 0 else 0
 
-    # Ground truth
     true_switch_day = np.full(N, -1)
     for i in range(N):
         active_times = np.where(states[i, :] == 1)[0]
         if len(active_times) > 0:
             true_switch_day[i] = active_times[0]
+
+    # DGP-specific metadata
+    if dgp_type == 'bimodal':
+        true_params = {
+            'DGP_type': 'Bimodal_Mixture',
+            'zero_prob': kwargs.get('zero_prob', 0.60),
+            'low_dist': 'Gamma(1, 1)',
+            'whale_dist': 'Gamma(10, 2)',
+            'whale_share': 0.50
+        }
+    else:
+        true_params = {
+            'DGP_type': 'Mixture',
+            'zero_prob': kwargs.get('zero_prob', 0.70),
+            'gamma_shape': kwargs.get('gamma_shape', 2.0),
+            'gamma_scale': kwargs.get('gamma_scale', 4.0)
+        }
 
     return {
         'obs_matrix': obs,
@@ -128,24 +155,16 @@ def generate_mixture_panel(n_customers=500, n_periods=100,
         'r_matrix': r_weeks,
         'f_matrix': f_run,
         'm_matrix': m_run,
-        'N': N,
-        'T': T,
-        'true_params': {
-            'DGP_type': 'Mixture_with_Recency_Churn',
-            'zero_prob': zero_prob,
-            'gamma_shape': gamma_shape,
-            'gamma_scale': gamma_scale,
-            'burn_in': burn_in,
-            'base_churn': 0.20,
-            'churn_increment': 0.02
-        },
+        'N': N, 'T': T,
+        'true_params': true_params,
         'true_switch_day': true_switch_day,
-        'last_purchase': last_purchase,
-        'generation_seed': seed
+        'generation_seed': seed,
+        'dgp_type': dgp_type
     }
 
+
 def save_to_rfm_csv(data_dict, output_csv):
-    """Convert panel to RFM CSV format"""
+    """Convert panel to RFM CSV format."""
     N, T = data_dict['N'], data_dict['T']
     obs = data_dict['obs_matrix']
     states = data_dict['states_matrix']
@@ -174,97 +193,113 @@ def save_to_rfm_csv(data_dict, output_csv):
     df.to_csv(output_csv, index=False)
     
     # Diagnostics
-    overall_zero_rate = (df['WeeklySpend'] == 0).mean()
+    overall_zero = (df['WeeklySpend'] == 0).mean()
     active_mask = df['true_state'] == 1
-    active_zero_rate = (df.loc[active_mask, 'WeeklySpend'] == 0).mean() if active_mask.sum() > 0 else 0
+    active_df = df[active_mask]
     
-    print(f"Saved RFM CSV: {output_csv}")
+    print(f"Saved: {output_csv}")
     print(f"  Shape: {df.shape}")
-    print(f"  Overall zero rate: {overall_zero_rate:.1%}")
-    print(f"  Zero rate in Active state: {active_zero_rate:.1%}")
-    print(f"  Mean spend (when >0): {df[df['WeeklySpend'] > 0]['WeeklySpend'].mean():.2f}")
-    print(f"  Std spend (when >0): {df[df['WeeklySpend'] > 0]['WeeklySpend'].std():.2f}")
+    print(f"  Overall zero rate: {overall_zero:.1%}")
+    
+    if active_mask.sum() > 0:
+        pos_spends = active_df[active_df['WeeklySpend'] > 0]['WeeklySpend']
+        print(f"  Active state - Zeros: {(active_df['WeeklySpend'] == 0).mean():.1%}")
+        print(f"  Active state - Mean: {pos_spends.mean():.2f}, Std: {pos_spends.std():.2f}")
+        
+        # Bimodality check if applicable
+        if pos_spends.std() > pos_spends.mean():
+            low_share = (pos_spends < pos_spends.quantile(0.33)).mean()
+            high_share = (pos_spends > pos_spends.quantile(0.67)).mean()
+            print(f"  Low tertile (<{pos_spends.quantile(0.33):.1f}): {low_share:.1%}")
+            print(f"  High tertile (>{pos_spends.quantile(0.67):.1f}): {high_share:.1%}")
     
     return df
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='GEMINI-ENHANCED Mixture DGP with Recency-Dependent Churn'
-    )
+    parser = argparse.ArgumentParser(description='Generate synthetic RFM panel')
+    parser.add_argument('--dgp', type=str, default='mixture', 
+                        choices=['mixture', 'bimodal'],
+                        help='DGP type: mixture (unimodal) or bimodal (extreme)')
     parser.add_argument('--n_customers', type=int, default=500)
     parser.add_argument('--n_periods', type=int, default=100)
-    parser.add_argument('--zero_prob', type=float, default=0.70)
-    parser.add_argument('--gamma_shape', type=float, default=2.0)
-    parser.add_argument('--gamma_scale', type=float, default=4.0,
-                        help='Higher = more variance, harder recovery (default: 4.0)')
-    parser.add_argument('--burn_in', type=int, default=5,
-                        help='Initial periods where all are State 0')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--output_pkl', type=str, default='ground_truth.pkl')
+    parser.add_argument('--output_pkl', type=str, default=None)
     parser.add_argument('--output_csv', type=str, default=None)
+    
+    # DGP-specific params
+    parser.add_argument('--zero_prob', type=float, default=None,
+                        help='Zero probability in active state (default: 0.70 mixture, 0.60 bimodal)')
+    parser.add_argument('--gamma_shape', type=float, default=2.0,
+                        help='[Mixture only] Gamma shape')
+    parser.add_argument('--gamma_scale', type=float, default=4.0,
+                        help='[Mixture only] Gamma scale')
     
     args = parser.parse_args()
     
+    # Set defaults based on DGP type
+    if args.zero_prob is None:
+        args.zero_prob = 0.60 if args.dgp == 'bimodal' else 0.70
+    
+    # Auto-generate output names if not specified
+    if args.output_pkl is None:
+        args.output_pkl = f'ground_truth_{args.dgp}.pkl'
+    if args.output_csv is None:
+        args.output_csv = f'simulation_{args.dgp}_rfm.csv'
+    
     print("="*70)
-    print("GEMINI-ENHANCED MIXTURE DGP")
+    print(f"GENERATING {args.dgp.upper()} DGP")
     print("="*70)
     print(f"Customers: {args.n_customers}, Periods: {args.n_periods}")
-    print(f"DGP: {args.zero_prob:.0%} zeros + {100-args.zero_prob:.0%} Gamma({args.gamma_shape}, {args.gamma_scale})")
-    print(f"Burn-in: {args.burn_in} periods (all State 0)")
-    print(f"Churn: Recency-dependent (20% + 2% per day since purchase)")
-    print("="*70)
-    print("\nRECOVERY CHALLENGE:")
-    print("  - HMM-Tweedie: Misspecified emission (assumes Tweedie, true is Mixture)")
-    print("  - HMM-Hurdle: Closer but still misspecified (binary gate vs recency-churn)")
-    print("  - Test: Can Tweedie's flexibility beat Hurdle's structural similarity?")
+    print(f"Zero prob: {args.zero_prob}")
+    if args.dgp == 'mixture':
+        print(f"Positive: Gamma({args.gamma_shape}, {args.gamma_scale})")
+    else:
+        print(f"Positive: 50% Gamma(1,1) + 50% Gamma(10,2) [BIMODAL]")
+    print(f"Seed: {args.seed}")
     print("="*70)
     
-    data = generate_mixture_panel(
+    # Generate
+    kwargs = {
+        'zero_prob': args.zero_prob,
+        'burn_in': 5
+    }
+    if args.dgp == 'mixture':
+        kwargs.update({
+            'gamma_shape': args.gamma_shape,
+            'gamma_scale': args.gamma_scale
+        })
+    
+    data = generate_panel(
+        dgp_type=args.dgp,
         n_customers=args.n_customers,
         n_periods=args.n_periods,
-        zero_prob=args.zero_prob,
-        gamma_shape=args.gamma_shape,
-        gamma_scale=args.gamma_scale,
-        burn_in=args.burn_in,
-        seed=args.seed
+        seed=args.seed,
+        **kwargs
     )
     
+    # Save
     with open(args.output_pkl, 'wb') as f:
         pickle.dump(data, f, protocol=4)
-    print(f"\nSaved ground truth to: {args.output_pkl}")
+    print(f"\nSaved: {args.output_pkl}")
     
     # Summary
-    print(f"\nGround Truth Summary:")
-    dead_obs = (data['states_matrix'] == 0).sum()
-    active_obs = (data['states_matrix'] == 1).sum()
-    print(f"  State 0 (Dead): {dead_obs} obs ({100*dead_obs/(dead_obs+active_obs):.1f}%)")
-    print(f"  State 1 (Active): {active_obs} obs ({100*active_obs/(dead_obs+active_obs):.1f}%)")
+    print(f"\nGround Truth:")
+    dead_pct = 100 * (data['states_matrix'] == 0).mean()
+    active_pct = 100 * (data['states_matrix'] == 1).mean()
+    print(f"  Dead: {dead_pct:.1f}%, Active: {active_pct:.1f}%")
     
     n_activated = (data['true_switch_day'] >= 0).sum()
-    print(f"  Customers activated: {n_activated}/{data['N']} ({100*n_activated/data['N']:.1f}%)")
-    if n_activated > 0:
-        print(f"  Mean activation day: {data['true_switch_day'][data['true_switch_day'] >= 0].mean():.1f}")
+    print(f"  Activated: {n_activated}/{data['N']} ({100*n_activated/data['N']:.1f}%)")
     
-    active_spend = data['obs_matrix'][data['states_matrix'] == 1]
-    if len(active_spend) > 0:
-        print(f"  Active state - Mean: {active_spend.mean():.2f}, Std: {active_spend.std():.2f}")
-        print(f"  Active state - Zero rate: {(active_spend == 0).mean():.1%}")
-    
-    overall_zeros = (data['obs_matrix'] == 0).mean()
-    print(f"\n  *** OVERALL ZERO RATE: {overall_zeros:.1%} ***")
-    print(f"  *** DGP: {data['true_params']['DGP_type']} ***")
-    
-    if args.output_csv:
-        save_to_rfm_csv(data, args.output_csv)
+    save_to_rfm_csv(data, args.output_csv)
     
     print("\n" + "="*70)
-    print("PAPER STORY:")
-    print("  If HMM-Tweedie recovers state timing better than HMM-Hurdle,")
-    print("  despite Hurdle being structurally closer to true DGP,")
-    print("  then Tweedie's semi-continuous kernel is the superior")
-    print("  'structural lens' for latent behavioral shifts.")
+    if args.dgp == 'bimodal':
+        print("BIMODAL DGP: Tests if Tweedie-HMM beats NBD on extreme data")
+    else:
+        print("MIXTURE DGP: Standard test with high zero-inflation")
     print("="*70)
-    print("\nDone.")
 
 if __name__ == "__main__":
     main()

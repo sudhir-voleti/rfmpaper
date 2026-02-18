@@ -14,6 +14,7 @@ import pickle
 import glob
 import argparse
 from pathlib import Path
+from scipy import stats
 
 
 def load_ground_truth(pkl_path):
@@ -23,9 +24,9 @@ def load_ground_truth(pkl_path):
     return data
 
 
-def extract_posterior_states(result_pkl, N, T):
+def extract_viterbi_states(result_pkl, N, T):
     """
-    Extract posterior P(State=1) from SMC result.
+    Extract Viterbi path from SMC result.
     Returns array of shape (N, T) or None if not available.
     """
     try:
@@ -34,66 +35,65 @@ def extract_posterior_states(result_pkl, N, T):
         
         idata = res['idata']
         
-        # Try to find state variable (z or states)
-        if 'posterior' in dir(idata):
-            post = idata.posterior
-            if 'z' in post:
-                # Average over chains and draws
-                post_probs = post['z'].mean(dim=['chain', 'draw']).values
-                return post_probs
-            elif 'states' in post:
-                post_probs = post['states'].mean(dim=['chain', 'draw']).values
-                return post_probs
-        
-        # Fallback: check if stored in res dict
-        if 'res' in res and 'posterior_probs' in res['res']:
-            return res['res']['posterior_probs']
+        if 'posterior' in dir(idata) and 'viterbi' in idata.posterior:
+            viterbi = idata.posterior['viterbi']
             
+            # Handle different shapes
+            # Expected: (chain, draw, N, T) or (N, T)
+            if 'chain' in viterbi.dims and 'draw' in viterbi.dims:
+                # Take mode over chains and draws
+                vals = viterbi.values
+                # Reshape to combine chain and draw, then take mode
+                n_chains, n_draws, n_cust, n_time = vals.shape
+                vals_reshaped = vals.reshape(n_chains * n_draws, n_cust, n_time)
+                viterbi_mode = stats.mode(vals_reshaped, axis=0)[0].squeeze()
+                return viterbi_mode
+            else:
+                # Already (N, T)
+                return viterbi.values
+        
+        return None
+        
     except Exception as e:
-        print(f"  Warning: Could not extract states from {result_pkl}: {e}")
-    
-    return None
+        print(f"  Warning: Could not extract viterbi from {result_pkl}: {e}")
+        return None
 
 
-def compute_recovery_metrics(true_states, post_probs, true_switch_day):
+def compute_recovery_metrics(true_states, pred_states, true_switch_day):
     """
     Compute state recovery metrics.
-    
-    Returns dict with:
-    - state_accuracy: % correct state classification (threshold 0.5)
-    - state_correlation: correlation between true and predicted probs
-    - mean_timing_error: |estimated_switch - true_switch| for activators
-    - brier_score: mean squared error of probabilities
     """
     metrics = {}
     
-    if post_probs is None:
-        return {'error': 'No posterior states found'}
+    if pred_states is None:
+        return {'error': 'No predicted states'}
     
     # Ensure shapes match
-    if post_probs.shape != true_states.shape:
-        return {'error': f'Shape mismatch: post_probs {post_probs.shape} vs true {true_states.shape}'}
+    if pred_states.shape != true_states.shape:
+        return {'error': f'Shape mismatch: pred {pred_states.shape} vs true {true_states.shape}'}
     
     N, T = true_states.shape
     
-    # 1. State accuracy (threshold 0.5)
-    pred_states = (post_probs > 0.5).astype(int)
+    # 1. State accuracy (overall)
     metrics['state_accuracy'] = (pred_states == true_states).mean()
     
-    # 2. State correlation
+    # 2. State correlation (treat as continuous 0/1)
     metrics['state_correlation'] = np.corrcoef(
         true_states.flatten(), 
-        post_probs.flatten()
+        pred_states.flatten()
     )[0, 1]
     
-    # 3. Brier score (proper scoring rule)
-    metrics['brier_score'] = np.mean((post_probs - true_states) ** 2)
+    # 3. Per-state accuracy
+    for state in [0, 1]:
+        mask = true_states == state
+        if mask.sum() > 0:
+            metrics[f'accuracy_state_{state}'] = (pred_states[mask] == state).mean()
     
     # 4. Timing error (for customers who activated)
-    # Estimate switch day as first time P(Active) > 0.5
+    # Estimate switch day from predicted states
     est_switch_day = np.full(N, -1)
     for i in range(N):
-        active_times = np.where(post_probs[i, :] > 0.5)[0]
+        active_times = np.where(pred_states[i, :] == 1)[0]
         if len(active_times) > 0:
             est_switch_day[i] = active_times[0]
     
@@ -103,44 +103,18 @@ def compute_recovery_metrics(true_states, post_probs, true_switch_day):
         metrics['mean_timing_error'] = timing_errors.mean()
         metrics['median_timing_error'] = np.median(timing_errors)
         
-        # Activation detection accuracy
+        # Activation detection
         true_activated = activated
         pred_activated = est_switch_day >= 0
         metrics['activation_precision'] = (true_activated & pred_activated).sum() / pred_activated.sum() if pred_activated.sum() > 0 else 0
         metrics['activation_recall'] = (true_activated & pred_activated).sum() / true_activated.sum() if true_activated.sum() > 0 else 0
     else:
         metrics['mean_timing_error'] = np.nan
-        metrics['median_timing_error'] = np.nan
-        metrics['activation_precision'] = 0
         metrics['activation_recall'] = 0
     
     return metrics
 
-def extract_posterior_states(result_pkl, N, T):
-    try:
-        with open(result_pkl, 'rb') as f:
-            res = pickle.load(f)
-        
-        idata = res['idata']
-        
-        # Try viterbi path first
-        if 'posterior' in dir(idata):
-            post = idata.posterior
-            if 'viterbi' in post:
-                # Use mode over chains/draws
-                viterbi = post['viterbi'].mode(dim=['chain', 'draw']).values
-                return viterbi
-            elif 'post_probs' in post:
-                probs = post['post_probs'].mean(dim=['chain', 'draw']).values
-                return probs  # Shape (N, T, K)
-            elif 'z' in post:
-                return post['z'].mean(dim=['chain', 'draw']).values
-        
-    except Exception as e:
-        print(f"  Error: {e}")
-    
-    return None
-    
+
 def main():
     parser = argparse.ArgumentParser(description='Evaluate simulation recovery')
     parser.add_argument('--ground_truth', type=str, default='ground_truth.pkl',
@@ -167,6 +141,7 @@ def main():
     print(f"Ground truth: {N} customers x {T} periods")
     print(f"True activation rate: {true_states.mean():.1%}")
     print(f"Mean switch day: {true_switch_day[true_switch_day >= 0].mean():.1f}")
+    print(f"DGP type: {truth.get('dgp_type', 'unknown')}")
     
     # Find all result files
     result_files = glob.glob(f"{args.results_dir}/smc_*.pkl")
@@ -177,14 +152,19 @@ def main():
     
     for rf in sorted(result_files):
         model_name = Path(rf).stem
-        print(f"\n{model_name}:")
+        print(f"\n{'='*70}")
+        print(f"Model: {model_name}")
+        print('='*70)
         
         # Extract model info from filename
         parts = model_name.split('_')
-        K = int([p for p in parts if p.startswith('K')][0].replace('K', ''))
-        model_type = [p for p in parts if p in ['POISSON', 'NBD', 'HURDLE', 'TWEEDIE']][0]
+        try:
+            K = int([p for p in parts if p.startswith('K')][0].replace('K', ''))
+        except:
+            K = 'unknown'
+        model_type = [p for p in parts if p in ['POISSON', 'NBD', 'HURDLE', 'TWEEDIE']][0] if any(p in parts for p in ['POISSON', 'NBD', 'HURDLE', 'TWEEDIE']) else 'unknown'
         
-        # Load log-evidence
+        # Load log-evidence and timing
         try:
             with open(rf, 'rb') as f:
                 res = pickle.load(f)
@@ -196,20 +176,21 @@ def main():
             time_min = np.nan
             print(f"  Log-Ev: N/A")
         
-        # Extract posterior states
-        post_probs = extract_posterior_states(rf, N, T)
+        # Extract Viterbi states
+        pred_states = extract_viterbi_states(rf, N, T)
         
-        if post_probs is not None:
-            print(f"  Extracted posterior states: {post_probs.shape}")
+        if pred_states is not None:
+            print(f"  Viterbi shape: {pred_states.shape}")
             
             # Compute metrics
-            metrics = compute_recovery_metrics(true_states, post_probs, true_switch_day)
+            metrics = compute_recovery_metrics(true_states, pred_states, true_switch_day)
             
             print(f"  State accuracy: {metrics.get('state_accuracy', 0):.3f}")
             print(f"  State correlation: {metrics.get('state_correlation', 0):.3f}")
-            print(f"  Brier score: {metrics.get('brier_score', 0):.3f}")
             if 'mean_timing_error' in metrics and not np.isnan(metrics['mean_timing_error']):
                 print(f"  Mean timing error: {metrics['mean_timing_error']:.1f} days")
+            if 'activation_recall' in metrics:
+                print(f"  Activation recall: {metrics['activation_recall']:.2f}")
             
             # Store results
             result_row = {
@@ -222,7 +203,7 @@ def main():
             }
             results_list.append(result_row)
         else:
-            print(f"  ✗ Could not extract states")
+            print(f"  ✗ Could not extract Viterbi states")
     
     # Create comparison table
     if results_list:
@@ -239,7 +220,7 @@ def main():
         
         # Select key columns for display
         display_cols = ['model_type', 'K', 'state_accuracy', 'state_correlation', 
-                       'brier_score', 'mean_timing_error', 'log_evidence']
+                       'mean_timing_error', 'activation_recall', 'log_evidence']
         available_cols = [c for c in display_cols if c in results_df.columns]
         
         print(results_df[available_cols].to_string(index=False))
@@ -255,22 +236,43 @@ def main():
         
         # Find best by different metrics
         if 'state_accuracy' in results_df.columns:
-            best_accuracy = results_df.loc[results_df['state_accuracy'].idxmax()]
-            print(f"Best state accuracy: {best_accuracy['model_type']} K={best_accuracy['K']} ({best_accuracy['state_accuracy']:.3f})")
-        
-        if 'brier_score' in results_df.columns:
-            best_brier = results_df.loc[results_df['brier_score'].idxmin()]
-            print(f"Best Brier score: {best_brier['model_type']} K={best_brier['K']} ({best_brier['brier_score']:.3f})")
+            best_idx = results_df['state_accuracy'].idxmax()
+            best = results_df.loc[best_idx]
+            print(f"Best state accuracy: {best['model_type']} K={best['K']} ({best['state_accuracy']:.3f})")
         
         if 'log_evidence' in results_df.columns:
-            best_logev = results_df.loc[results_df['log_evidence'].idxmax()]
-            print(f"Best Log-Evidence: {best_logev['model_type']} K={best_logev['K']} ({best_logev['log_evidence']:.2f})")
+            best_idx = results_df['log_evidence'].idxmax()
+            best = results_df.loc[best_idx]
+            print(f"Best Log-Evidence: {best['model_type']} K={best['K']} ({best['log_evidence']:.2f})")
         
-        print("\nPaper story:")
-        print("  If Tweedie K=2/3 has best state recovery but not best Log-Ev,")
-        print("  then Tweedie-HMM provides superior structural insight")
-        print("  despite not being the 'best fitting' model.")
+        # The key test
+        print("\n" + "="*70)
+        print("KEY TEST: Does Tweedie-HMM have better state accuracy")
+        print("         but worse Log-Evidence than NBD?")
         print("="*70)
+        
+        tweedie_k2 = results_df[(results_df['model_type'] == 'TWEEDIE') & (results_df['K'] == 2)]
+        nbd_k1 = results_df[(results_df['model_type'] == 'NBD') & (results_df['K'] == 1)]
+        
+        if not tweedie_k2.empty and not nbd_k1.empty:
+            t_acc = tweedie_k2['state_accuracy'].values[0]
+            n_acc = nbd_k1['state_accuracy'].values[0]
+            t_ev = tweedie_k2['log_evidence'].values[0]
+            n_ev = nbd_k1['log_evidence'].values[0]
+            
+            print(f"\nTweedie K=2: Acc={t_acc:.3f}, LogEv={t_ev:.2f}")
+            print(f"NBD K=1:     Acc={n_acc:.3f}, LogEv={n_ev:.2f}")
+            
+            if t_acc > n_acc and t_ev < n_ev:
+                print("\n✓✓✓ SUCCESS: Tweedie-HMM recovers states better despite worse fit!")
+                print("   This proves structural insight value.")
+            elif t_acc > n_acc and t_ev > n_ev:
+                print("\n✓ Tweedie wins on both (unexpected but good)")
+            elif t_acc < n_acc and t_ev < n_ev:
+                print("\n✗ Tweedie loses on both (story fails)")
+            else:
+                print("\n? Mixed results (needs investigation)")
+        
     else:
         print("\nNo valid results to compare")
 

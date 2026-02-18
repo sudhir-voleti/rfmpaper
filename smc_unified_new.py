@@ -224,10 +224,10 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
             # Store posterior state probabilities (marginal)
             # Reshape to (N, T, K) for time-varying probabilities
             log_alpha_reshaped = log_alpha.reshape((N, T, K))
-            post_probs = pt.exp(log_alpha_reshaped - pt.logsumexp(log_alpha_reshaped, axis=2, keepdims=True))
+            #post_probs = pt.exp(log_alpha_reshaped - pt.logsumexp(log_alpha_reshaped, axis=2, keepdims=True))
             
             pm.Deterministic('viterbi', viterbi_path)
-            pm.Deterministic('post_probs', post_probs)
+            #pm.Deterministic('post_probs', post_probs)
         # === END ADD ===
         return model
 
@@ -393,10 +393,10 @@ def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
             
             # Store posterior state probabilities (marginal)
             # Approximate: use normalized forward probabilities
-            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            #post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
             
             pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
-            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+            #pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
         # === END ADD ===
         return model
 
@@ -518,10 +518,10 @@ def make_poisson_model(data, K=3, use_gam=True, gam_df=3):
             
             # Store posterior state probabilities (marginal)
             # Approximate: use normalized forward probabilities
-            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            #post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
             
             pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
-            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+            #pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
         # === END ADD ===
 
         return model        
@@ -655,10 +655,10 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
             
             # Store posterior state probabilities (marginal)
             # Approximate: use normalized forward probabilities
-            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            #post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
             
             pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
-            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+            #pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
         # === END ADD ===
 
         return model        

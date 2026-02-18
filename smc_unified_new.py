@@ -101,7 +101,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N)}) as model:
+    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))

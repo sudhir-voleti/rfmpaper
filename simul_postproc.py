@@ -116,7 +116,31 @@ def compute_recovery_metrics(true_states, post_probs, true_switch_day):
     
     return metrics
 
-
+def extract_posterior_states(result_pkl, N, T):
+    try:
+        with open(result_pkl, 'rb') as f:
+            res = pickle.load(f)
+        
+        idata = res['idata']
+        
+        # Try viterbi path first
+        if 'posterior' in dir(idata):
+            post = idata.posterior
+            if 'viterbi' in post:
+                # Use mode over chains/draws
+                viterbi = post['viterbi'].mode(dim=['chain', 'draw']).values
+                return viterbi
+            elif 'post_probs' in post:
+                probs = post['post_probs'].mean(dim=['chain', 'draw']).values
+                return probs  # Shape (N, T, K)
+            elif 'z' in post:
+                return post['z'].mean(dim=['chain', 'draw']).values
+        
+    except Exception as e:
+        print(f"  Error: {e}")
+    
+    return None
+    
 def main():
     parser = argparse.ArgumentParser(description='Evaluate simulation recovery')
     parser.add_argument('--ground_truth', type=str, default='ground_truth.pkl',

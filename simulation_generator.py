@@ -61,7 +61,8 @@ def generate_bimodal_observations(n, zero_prob=0.60):
     return result
 
 
-def generate_panel(dgp_type='mixture', n_customers=500, n_periods=100, seed=42, **kwargs):
+def generate_panel(dgp_type='mixture', n_customers=500, n_periods=100, seed=42, 
+                   burn_in=5, **obs_kwargs):
     """
     Generate panel with specified DGP type.
     
@@ -269,13 +270,13 @@ def main():
             'gamma_shape': args.gamma_shape,
             'gamma_scale': args.gamma_scale
         })
-    
     data = generate_panel(
         dgp_type=args.dgp,
         n_customers=args.n_customers,
         n_periods=args.n_periods,
         seed=args.seed,
-        **kwargs
+        burn_in=5,  # Pass separately
+        **obs_kwargs  # Only zero_prob, gamma_shape, gamma_scale
     )
     
     # Save

@@ -223,7 +223,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
             
             # Store posterior state probabilities (marginal)
             # Reshape to (N, T, K) for time-varying probabilities
-            log_alpha_reshaped = log_alpha.reshape((N, T, K))
+            #log_alpha_reshaped = log_alpha.reshape((N, T, K))
             #post_probs = pt.exp(log_alpha_reshaped - pt.logsumexp(log_alpha_reshaped, axis=2, keepdims=True))
             
             pm.Deterministic('viterbi', viterbi_path)

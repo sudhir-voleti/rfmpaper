@@ -616,9 +616,9 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
     t0 = time.time()
 
     try:
-        if model_type in ['poisson', 'nbd']:
+        if model_type in ['poisson', 'nbd', 'hurdle']:
             with model_builder(data, K=K, use_gam=use_gam, gam_df=gam_df) as model:
-                print(f" Model: K={K}, {model_type.upper()}-{'GAM' if use_gam else 'GLM'} (DISCRETE)")
+                print(f" Model: K={K}, {model_type.upper()}-{'GAM' if use_gam else 'GLM'}")
                 idata = pm.sample_smc(draws=draws, chains=chains, cores=cores,
                                      random_seed=seed, return_inferencedata=True, threshold=0.8)
         else:
@@ -652,6 +652,28 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
         except:
             pass
 
+        elapsed = (time.time() - t0) / 60
+
+        res = {
+            'K': K, 'model_type': model_type, 'N': data['N'], 'T': data['T'],
+            'use_gam': use_gam, 'gam_df': gam_df if use_gam else None,
+            'log_evidence': log_ev, 'draws': draws, 'chains': chains,
+            'time_min': elapsed, 'timestamp': time.strftime('%Y%m%d_%H%M%S')
+        }
+
+        p_tag = f"p{p_fixed}" if (model_type == 'tweedie' and not state_specific_p and K > 1) else "statep" if (state_specific_p and K > 1) else "discrete"
+        pkl_path = out_dir / f"smc_K{K}_{model_type.upper()}_{'GAM' if use_gam else 'GLM'}_{p_tag}_N{data['N']}_D{draws}.pkl"
+
+        with open(pkl_path, 'wb') as f:
+            pickle.dump({'idata': idata, 'res': res}, f, protocol=4)
+
+        print(f" ✓ log_ev={log_ev:.2f}, time={elapsed:.1f}min")
+        return pkl_path, res
+
+    except Exception as e:
+        print(f" ✗ CRASH: {str(e)[:60]}")
+        raise
+        
         elapsed = (time.time() - t0) / 60
 
         res = {

@@ -3,13 +3,10 @@
 simulation_generator.py
 =======================
 Generate synthetic RFM panel data with known ground truth states.
-For testing state recovery in HMM models.
+HIGH CLUMPINESS version (>75% zeros overall)
 
 Usage:
     python simulation_generator.py --n_customers 500 --n_periods 100 --output_pkl ground_truth.pkl
-    
-Or via exec_gitcode.py:
-    exec_from_github(url, ['--n_customers', '50', '--n_periods', '20', '--output_csv', 'sim_data.csv'])
 """
 
 import numpy as np
@@ -18,7 +15,7 @@ import pickle
 import argparse
 from datetime import datetime, timedelta
 
-def rcompound_poisson_gamma(n, lambda_poisson, shape_gamma, scale_gamma, p=1.6):
+def rcompound_poisson_gamma(n, lambda_poisson, shape_gamma, scale_gamma, p=1.2):
     """Generate Tweedie(p) via compound Poisson-Gamma."""
     N = np.random.poisson(lambda_poisson, size=n)
     samples = np.zeros(n)
@@ -30,14 +27,15 @@ def rcompound_poisson_gamma(n, lambda_poisson, shape_gamma, scale_gamma, p=1.6):
         samples[positive_mask] = np.add.reduceat(gamma_draws, indices)
     return samples
 
-def generate_hmm_tweedie_panel(n_customers=500, n_periods=100, p_true=1.6,
-                                phi_true=2.0, mu_active=5.0, seed=42):
-    """Generate panel with stochastic state transitions and Tweedie observations."""
+def generate_hmm_tweedie_panel(n_customers=500, n_periods=100, p_true=1.2,
+                                phi_true=10.0, mu_active=1.0, seed=42):
+    """Generate HIGH CLUMPINESS panel with >75% zeros."""
     np.random.seed(seed)
     N, T = n_customers, n_periods
 
-    # State transitions (logistic "vibe")
-    time_norm = np.linspace(-3, 3, T)
+    # MUCH slower activation - most stay dead for long time
+    # Shifted right: starts near 0, only rises at end
+    time_norm = np.linspace(-6, 2, T)  # Slow ramp, late activation
     p_active_vibe = 1 / (1 + np.exp(-time_norm))
 
     states = np.zeros((N, T), dtype=int)
@@ -46,11 +44,14 @@ def generate_hmm_tweedie_panel(n_customers=500, n_periods=100, p_true=1.6,
     for t in range(1, T):
         for i in range(N):
             if states[i, t-1] == 0:
+                # Low probability of activation early on
                 states[i, t] = 1 if np.random.rand() < p_active_vibe[t] else 0
             else:
-                states[i, t] = 1 if np.random.rand() < 0.95 else 0
+                # Higher churn back to dead (20% chance)
+                states[i, t] = 1 if np.random.rand() < 0.80 else 0
 
-    # Tweedie observations
+    # HIGH CLUMPINESS Tweedie parameters
+    # p=1.2 (lots of zeros), phi=10 (high variance), mu=1 (low mean)
     lambda_poisson = (mu_active ** (2 - p_true)) / (phi_true * (2 - p_true))
     shape_gamma = (2 - p_true) / (p_true - 1)
     scale_gamma = phi_true * (p_true - 1) * (mu_active ** (p_true - 1))
@@ -107,7 +108,7 @@ def generate_hmm_tweedie_panel(n_customers=500, n_periods=100, p_true=1.6,
     }
 
 def save_to_rfm_csv(data_dict, output_csv):
-    """Convert panel data to RFM CSV format for smc_unified.py"""
+    """Convert panel data to RFM CSV format"""
     N, T = data_dict['N'], data_dict['T']
     obs = data_dict['obs_matrix']
     states = data_dict['states_matrix']
@@ -115,7 +116,6 @@ def save_to_rfm_csv(data_dict, output_csv):
     f_run = data_dict['f_matrix']
     m_run = data_dict['m_matrix']
     
-    # Create synthetic dates (weekly)
     base_date = datetime(2020, 1, 1)
     dates = [base_date + timedelta(weeks=t) for t in range(T)]
     
@@ -143,37 +143,28 @@ def save_to_rfm_csv(data_dict, output_csv):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate synthetic RFM panel data with ground truth states'
+        description='Generate HIGH CLUMPINESS synthetic RFM panel (>75% zeros)'
     )
-    parser.add_argument('--n_customers', type=int, default=500,
-                        help='Number of customers (default: 500)')
-    parser.add_argument('--n_periods', type=int, default=100,
-                        help='Number of time periods (default: 100)')
-    parser.add_argument('--p_true', type=float, default=1.6,
-                        help='True Tweedie power parameter (default: 1.6)')
-    parser.add_argument('--phi_true', type=float, default=2.0,
-                        help='True Tweedie dispersion (default: 2.0)')
-    parser.add_argument('--mu_active', type=float, default=5.0,
-                        help='Mean spend in active state (default: 5.0)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed (default: 42)')
-    parser.add_argument('--output_pkl', type=str, default='ground_truth.pkl',
-                        help='Output pickle file (default: ground_truth.pkl)')
-    parser.add_argument('--output_csv', type=str, default=None,
-                        help='Optional: also save as RFM CSV for smc_unified.py')
+    parser.add_argument('--n_customers', type=int, default=500)
+    parser.add_argument('--n_periods', type=int, default=100)
+    parser.add_argument('--p_true', type=float, default=1.2)      # Lower = more zeros
+    parser.add_argument('--phi_true', type=float, default=10.0)   # Higher = more variance
+    parser.add_argument('--mu_active', type=float, default=1.0)   # Lower = more zeros
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--output_pkl', type=str, default='ground_truth.pkl')
+    parser.add_argument('--output_csv', type=str, default=None)
     
     args = parser.parse_args()
     
     print("="*60)
-    print("GENERATING SYNTHETIC RFM PANEL DATA")
+    print("GENERATING HIGH CLUMPINESS RFM PANEL (>75% zeros)")
     print("="*60)
     print(f"Customers: {args.n_customers}")
     print(f"Periods: {args.n_periods}")
-    print(f"Tweedie p: {args.p_true}, phi: {args.phi_true}")
+    print(f"Tweedie p: {args.p_true}, phi: {args.phi_true}, mu: {args.mu_active}")
     print(f"Seed: {args.seed}")
     print("="*60)
     
-    # Generate data
     data = generate_hmm_tweedie_panel(
         n_customers=args.n_customers,
         n_periods=args.n_periods,
@@ -183,25 +174,27 @@ def main():
         seed=args.seed
     )
     
-    # Save pickle
     with open(args.output_pkl, 'wb') as f:
         pickle.dump(data, f, protocol=4)
     print(f"\nSaved ground truth to: {args.output_pkl}")
     
-    # Print summary
     print(f"\nGround Truth Summary:")
     print(f"  State 0 (Dead): {(data['states_matrix'] == 0).sum()} obs ({100*(data['states_matrix'] == 0).mean():.1f}%)")
     print(f"  State 1 (Active): {(data['states_matrix'] == 1).sum()} obs ({100*(data['states_matrix'] == 1).mean():.1f}%)")
     
     n_activated = (data['true_switch_day'] >= 0).sum()
     print(f"  Customers activated: {n_activated}/{data['N']} ({100*n_activated/data['N']:.1f}%)")
-    print(f"  Mean activation day: {data['true_switch_day'][data['true_switch_day'] >= 0].mean():.1f}")
+    if n_activated > 0:
+        print(f"  Mean activation day: {data['true_switch_day'][data['true_switch_day'] >= 0].mean():.1f}")
     
     active_spend = data['obs_matrix'][data['states_matrix'] == 1]
-    print(f"  Active state spend: mean={active_spend.mean():.2f}, std={active_spend.std():.2f}")
-    print(f"  Zero rate in active state: {(active_spend == 0).mean():.1%}")
+    if len(active_spend) > 0:
+        print(f"  Active state spend: mean={active_spend.mean():.2f}, std={active_spend.std():.2f}")
+        print(f"  Zero rate in active state: {(active_spend == 0).mean():.1%}")
     
-    # Optionally save CSV
+    overall_zeros = (data['obs_matrix'] == 0).mean()
+    print(f"\n  *** OVERALL ZERO RATE: {overall_zeros:.1%} ***")
+    
     if args.output_csv:
         save_to_rfm_csv(data, args.output_csv)
     

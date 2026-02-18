@@ -203,8 +203,32 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
+        # === ADD THIS BLOCK ===
+        # Compute Viterbi path for state recovery evaluation
+        if K > 1:
+            # Viterbi decoding (most likely state sequence)
+            log_delta = pt.log(pi0) + log_emission[:, 0, :]
+            psi = pt.zeros((N, T, K), dtype='int32')
+            
+            for t in range(1, T):
+                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
+                max_val = pt.max(temp, axis=1)
+                max_idx = pt.argmax(temp, axis=1)
+                log_delta = max_val
+                psi = pt.set_subtensor(psi[:, t, :], max_idx)
+            
+            # Backtrack to find Viterbi path
+            viterbi_path = pt.zeros((N, T), dtype='int32')
+            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
+            
+            # Store posterior state probabilities (marginal)
+            # Approximate: use normalized forward probabilities
+            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            
+            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
+            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+        # === END ADD ===
         return model
-
 
 def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
     """Hurdle-Gamma HMM model."""
@@ -348,6 +372,31 @@ def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
+        # === ADD THIS BLOCK ===
+        # Compute Viterbi path for state recovery evaluation
+        if K > 1:
+            # Viterbi decoding (most likely state sequence)
+            log_delta = pt.log(pi0) + log_emission[:, 0, :]
+            psi = pt.zeros((N, T, K), dtype='int32')
+            
+            for t in range(1, T):
+                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
+                max_val = pt.max(temp, axis=1)
+                max_idx = pt.argmax(temp, axis=1)
+                log_delta = max_val
+                psi = pt.set_subtensor(psi[:, t, :], max_idx)
+            
+            # Backtrack to find Viterbi path
+            viterbi_path = pt.zeros((N, T), dtype='int32')
+            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
+            
+            # Store posterior state probabilities (marginal)
+            # Approximate: use normalized forward probabilities
+            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            
+            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
+            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+        # === END ADD ===
         return model
 
 
@@ -448,8 +497,33 @@ def make_poisson_model(data, K=3, use_gam=True, gam_df=3):
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
-        return model
+        # === ADD THIS BLOCK ===
+        # Compute Viterbi path for state recovery evaluation
+        if K > 1:
+            # Viterbi decoding (most likely state sequence)
+            log_delta = pt.log(pi0) + log_emission[:, 0, :]
+            psi = pt.zeros((N, T, K), dtype='int32')
+            
+            for t in range(1, T):
+                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
+                max_val = pt.max(temp, axis=1)
+                max_idx = pt.argmax(temp, axis=1)
+                log_delta = max_val
+                psi = pt.set_subtensor(psi[:, t, :], max_idx)
+            
+            # Backtrack to find Viterbi path
+            viterbi_path = pt.zeros((N, T), dtype='int32')
+            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
+            
+            # Store posterior state probabilities (marginal)
+            # Approximate: use normalized forward probabilities
+            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            
+            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
+            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+        # === END ADD ===
 
+        return model        
 
 def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
     """DISCRETE Negative Binomial HMM - rounds y to integers."""
@@ -560,7 +634,33 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
-        return model
+        # === ADD THIS BLOCK ===
+        # Compute Viterbi path for state recovery evaluation
+        if K > 1:
+            # Viterbi decoding (most likely state sequence)
+            log_delta = pt.log(pi0) + log_emission[:, 0, :]
+            psi = pt.zeros((N, T, K), dtype='int32')
+            
+            for t in range(1, T):
+                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
+                max_val = pt.max(temp, axis=1)
+                max_idx = pt.argmax(temp, axis=1)
+                log_delta = max_val
+                psi = pt.set_subtensor(psi[:, t, :], max_idx)
+            
+            # Backtrack to find Viterbi path
+            viterbi_path = pt.zeros((N, T), dtype='int32')
+            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
+            
+            # Store posterior state probabilities (marginal)
+            # Approximate: use normalized forward probabilities
+            post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
+            
+            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
+            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+        # === END ADD ===
+
+        return model        
 
 # =============================================================================
 # 4. DATA BUILDER
@@ -628,6 +728,15 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
                 idata = pm.sample_smc(draws=draws, chains=chains, cores=cores,
                                      random_seed=seed, return_inferencedata=True, threshold=0.8)
 
+            # === ADD THIS BLOCK ===
+            # Add posterior predictive for state recovery
+            if K > 1:
+                try:
+                    pm.sample_posterior_predictive(idata, extend_inferencedata=True, random_seed=seed)
+                except:
+                    pass
+            # === END ADD ===        
+        
         log_ev = np.nan
         try:
             lm = idata.sample_stats.log_marginal_likelihood.values

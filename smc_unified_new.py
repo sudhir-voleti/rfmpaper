@@ -101,7 +101,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
+    with pm.Model(coords={"customer": np.arange(N)}) as model:
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
@@ -225,8 +225,8 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
             # Approximate: use normalized forward probabilities
             post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
             
-            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
-            pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
+            pm.Deterministic('viterbi', viterbi_path)
+            pm.Deterministic('post_probs', post_probs)
         # === END ADD ===
         return model
 

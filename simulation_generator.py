@@ -13,27 +13,17 @@ Usage:
 import numpy as np
 import pandas as pd
 import pickle
+import csv
 import argparse
 from datetime import datetime, timedelta
 
 
-def rcompound_poisson_gamma(n, lambda_poisson, shape_gamma, scale_gamma, p=1.2):
-    """Generate Tweedie(p) via compound Poisson-Gamma."""
-    N = np.random.poisson(lambda_poisson, size=n)
-    samples = np.zeros(n)
-    positive_mask = N > 0
-    if np.any(positive_mask):
-        total_components = N[positive_mask].sum()
-        gamma_draws = np.random.gamma(shape=shape_gamma, scale=scale_gamma, size=total_components)
-        indices = np.concatenate([[0], np.cumsum(N[positive_mask])[:-1]])
-        samples[positive_mask] = np.add.reduceat(gamma_draws, indices)
-    return samples
-
+# =============================================================================
+# OBSERVATION GENERATORS
+# =============================================================================
 
 def generate_mixed_observations(n, zero_prob=0.70, gamma_shape=2.0, gamma_scale=4.0):
-    """
-    MIXTURE DGP (unimodal): zero_prob zeros + Gamma(gamma_shape, gamma_scale)
-    """
+    """MIXTURE: zero_prob zeros + Gamma(gamma_shape, gamma_scale)"""
     is_zero = np.random.rand(n) < zero_prob
     result = np.zeros(n)
     n_positive = (~is_zero).sum()
@@ -43,10 +33,7 @@ def generate_mixed_observations(n, zero_prob=0.70, gamma_shape=2.0, gamma_scale=
 
 
 def generate_bimodal_observations(n, zero_prob=0.60):
-    """
-    BIMODAL DGP (extreme): zero_prob zeros + 50% Gamma(1,1) + 50% Gamma(10,2)
-    Creates massive variance that NBD cannot capture.
-    """
+    """BIMODAL: 60% zeros + 50% Gamma(1,1) + 50% Gamma(10,2)"""
     is_zero = np.random.rand(n) < zero_prob
     result = np.zeros(n)
     n_positive = (~is_zero).sum()
@@ -54,30 +41,63 @@ def generate_bimodal_observations(n, zero_prob=0.60):
     if n_positive > 0:
         is_whale = np.random.rand(n_positive) < 0.5
         result_pos = np.zeros(n_positive)
-        result_pos[is_whale] = np.random.gamma(10, 2, is_whale.sum())  # Whales: mean=20
-        result_pos[~is_whale] = np.random.gamma(1, 1, (~is_whale).sum())  # Low: mean=1
+        result_pos[is_whale] = np.random.gamma(10, 2, is_whale.sum())
+        result_pos[~is_whale] = np.random.gamma(1, 1, (~is_whale).sum())
         result[~is_zero] = result_pos
     
     return result
 
 
-def generate_panel(dgp_type='mixture', n_customers=500, n_periods=100, seed=42, 
-                   burn_in=5, **obs_kwargs):
-    """
-    Generate panel with specified DGP type.
+def generate_4mode_observations(n, state, state_zero_probs=None):
+    """4-MODE: State-dependent Gamma emissions WITH zero-inflation"""
+    if state_zero_probs is None:
+        # Default: high zeros for low states, lower for high states
+        state_zero_probs = {0: 1.0, 1: 0.80, 2: 0.50, 3: 0.30, 4: 0.20}
     
-    Parameters:
-    -----------
-    dgp_type : str
-        'mixture' or 'bimodal'
-    n_customers, n_periods, seed : standard
-    **kwargs : passed to observation generator (zero_prob, etc.)
-    """
+    result = np.zeros(n)
+    
+    for s in [0, 1, 2, 3, 4]:
+        mask = state == s
+        if mask.sum() > 0:
+            if s == 0:
+                # Dead state: all zeros
+                result[mask] = 0.0
+            else:
+                # Active states: zero-inflated Gamma
+                n_s = mask.sum()
+                is_zero = np.random.rand(n_s) < state_zero_probs[s]
+                result_s = np.zeros(n_s)
+                
+                n_pos = (~is_zero).sum()
+                if n_pos > 0:
+                    if s == 1:
+                        result_s[~is_zero] = np.random.gamma(1, 0.5, n_pos)
+                    elif s == 2:
+                        result_s[~is_zero] = np.random.gamma(5, 1, n_pos)
+                    elif s == 3:
+                        result_s[~is_zero] = np.random.gamma(10, 2, n_pos)
+                    elif s == 4:
+                        result_s[~is_zero] = np.random.gamma(15, 3, n_pos)
+                
+                result[mask] = result_s
+    
+    return result
+
+# =============================================================================
+# PANEL GENERATORS
+# =============================================================================
+
+def generate_mixture_panel(n_customers=500, n_periods=100, seed=42, **kwargs):
+    """Standard mixture DGP with recency-dependent churn."""
     np.random.seed(seed)
     N, T = n_customers, n_periods
     
-    # State dynamics (same for both DGPs)
+    zero_prob = kwargs.get('zero_prob', 0.70)
+    gamma_shape = kwargs.get('gamma_shape', 2.0)
+    gamma_scale = kwargs.get('gamma_scale', 4.0)
     burn_in = kwargs.get('burn_in', 5)
+    
+    # Activation curve
     time_norm = np.linspace(-6, 2, T - burn_in)
     p_active_vibe = np.concatenate([np.zeros(burn_in), 1 / (1 + np.exp(-time_norm))])
     
@@ -99,208 +119,642 @@ def generate_panel(dgp_type='mixture', n_customers=500, n_periods=100, seed=42,
                 churn_prob = min(churn_prob, 0.80)
                 states[i, t] = 0 if np.random.rand() < churn_prob else 1
         
-        # Generate observations based on DGP type
+        # Generate observations
         active = (states[:, t] == 1)
         if active.sum() > 0:
-            if dgp_type == 'bimodal':
-                obs[active, t] = generate_bimodal_observations(active.sum(), **kwargs)
-            else:  # mixture
-                obs[active, t] = generate_mixed_observations(active.sum(), **kwargs)
-            
+            obs[active, t] = generate_mixed_observations(
+                active.sum(), zero_prob, gamma_shape, gamma_scale
+            )
             positive = obs[:, t] > 0
             last_purchase[positive] = t
 
-    # RFM metrics
-    r_weeks = np.zeros((N, T))
-    f_run = np.zeros((N, T))
-    m_run = np.zeros((N, T))
-
-    for i in range(N):
-        last_purchase_i, cum_count, cum_spend = -999, 0, 0.0
-        for t in range(T):
-            spend = obs[i, t]
-            r_weeks[i, t] = t - last_purchase_i if last_purchase_i >= 0 else 999
-            if spend > 0:
-                cum_count += 1
-                last_purchase_i = t
-                cum_spend += spend
-            f_run[i, t] = cum_count
-            m_run[i, t] = cum_spend / cum_count if cum_count > 0 else 0
-
-    true_switch_day = np.full(N, -1)
-    for i in range(N):
-        active_times = np.where(states[i, :] == 1)[0]
-        if len(active_times) > 0:
-            true_switch_day[i] = active_times[0]
-
-    # DGP-specific metadata
-    if dgp_type == 'bimodal':
-        true_params = {
-            'DGP_type': 'Bimodal_Mixture',
-            'zero_prob': kwargs.get('zero_prob', 0.60),
-            'low_dist': 'Gamma(1, 1)',
-            'whale_dist': 'Gamma(10, 2)',
-            'whale_share': 0.50
-        }
-    else:
-        true_params = {
-            'DGP_type': 'Mixture',
-            'zero_prob': kwargs.get('zero_prob', 0.70),
-            'gamma_shape': kwargs.get('gamma_shape', 2.0),
-            'gamma_scale': kwargs.get('gamma_scale', 4.0)
-        }
-
-    return {
-        'obs_matrix': obs,
-        'states_matrix': states,
-        'r_matrix': r_weeks,
-        'f_matrix': f_run,
-        'm_matrix': m_run,
-        'N': N, 'T': T,
-        'true_params': true_params,
-        'true_switch_day': true_switch_day,
-        'generation_seed': seed,
-        'dgp_type': dgp_type
+    true_params = {
+        'DGP_type': 'Mixture',
+        'zero_prob': zero_prob,
+        'gamma_shape': gamma_shape,
+        'gamma_scale': gamma_scale
     }
+    
+    return _package_results(N, T, states, obs, true_params, seed)
 
 
-def save_to_rfm_csv(data_dict, output_csv):
-    """Convert panel to RFM CSV format."""
-    N, T = data_dict['N'], data_dict['T']
-    obs = data_dict['obs_matrix']
-    states = data_dict['states_matrix']
-    r_weeks = data_dict['r_matrix']
-    f_run = data_dict['f_matrix']
-    m_run = data_dict['m_matrix']
+def generate_bimodal_panel(n_customers=100, n_periods=60, seed=42, **kwargs):
+    """Bimodal DGP: low spenders vs whales."""
+    np.random.seed(seed)
+    N, T = n_customers, n_periods
     
-    base_date = datetime(2020, 1, 1)
-    dates = [base_date + timedelta(weeks=t) for t in range(T)]
+    zero_prob = kwargs.get('zero_prob', 0.60)
+    burn_in = kwargs.get('burn_in', 5)
     
-    rows = []
-    for i in range(N):
-        for t in range(T):
-            rows.append({
-                'customer_id': f'CUST_{i:04d}',
-                'WeekStart': dates[t],
-                'WeeklySpend': obs[i, t],
-                'R_weeks': r_weeks[i, t],
-                'F_run': f_run[i, t],
-                'M_run': m_run[i, t],
-                'p0_cust': 0.0,
-                'true_state': int(states[i, t])
-            })
+    time_norm = np.linspace(-6, 2, T - burn_in)
+    p_active_vibe = np.concatenate([np.zeros(burn_in), 1 / (1 + np.exp(-time_norm))])
     
-    df = pd.DataFrame(rows)
-    df.to_csv(output_csv, index=False)
-    
-    # Diagnostics
-    overall_zero = (df['WeeklySpend'] == 0).mean()
-    active_mask = df['true_state'] == 1
-    active_df = df[active_mask]
-    
-    print(f"Saved: {output_csv}")
-    print(f"  Shape: {df.shape}")
-    print(f"  Overall zero rate: {overall_zero:.1%}")
-    
-    if active_mask.sum() > 0:
-        pos_spends = active_df[active_df['WeeklySpend'] > 0]['WeeklySpend']
-        print(f"  Active state - Zeros: {(active_df['WeeklySpend'] == 0).mean():.1%}")
-        print(f"  Active state - Mean: {pos_spends.mean():.2f}, Std: {pos_spends.std():.2f}")
+    states = np.zeros((N, T), dtype=int)
+    obs = np.zeros((N, T))
+    last_purchase = np.full(N, -999)
+
+    for t in range(T):
+        for i in range(N):
+            if t == 0:
+                states[i, t] = 0
+            elif states[i, t-1] == 0:
+                states[i, t] = 1 if np.random.rand() < p_active_vibe[t] else 0
+                if states[i, t] == 1:
+                    last_purchase[i] = t
+            else:
+                days_since = t - last_purchase[i] if last_purchase[i] >= 0 else 0
+                churn_prob = 0.20 + (0.02 * days_since)
+                churn_prob = min(churn_prob, 0.80)
+                states[i, t] = 0 if np.random.rand() < churn_prob else 1
         
-        # Bimodality check if applicable
-        if pos_spends.std() > pos_spends.mean():
-            low_share = (pos_spends < pos_spends.quantile(0.33)).mean()
-            high_share = (pos_spends > pos_spends.quantile(0.67)).mean()
-            print(f"  Low tertile (<{pos_spends.quantile(0.33):.1f}): {low_share:.1%}")
-            print(f"  High tertile (>{pos_spends.quantile(0.67):.1f}): {high_share:.1%}")
-    
-    return df
+        active = (states[:, t] == 1)
+        if active.sum() > 0:
+            obs[active, t] = generate_bimodal_observations(active.sum(), zero_prob)
+            positive = obs[:, t] > 0
+            last_purchase[positive] = t
 
+    true_params = {
+        'DGP_type': 'Bimodal',
+        'zero_prob': zero_prob,
+        'low_dist': 'Gamma(1, 1)',
+        'whale_dist': 'Gamma(10, 2)'
+    }
+    
+    return _package_results(N, T, states, obs, true_params, seed)
+
+## ----
+
+def generate_3mode_panel(n_customers=300, n_periods=100, seed=42, **kwargs):
+    """3-MODE DGP: Dead + Light + Regular + Heavy (merged high states)."""
+    np.random.seed(seed)
+    N, T = n_customers, n_periods
+    
+    # Start spread: 25% each state
+    states = np.zeros((N, T), dtype=int)
+    obs = np.zeros((N, T))
+    tenure = np.zeros(N, dtype=int)
+    
+    initial_dist = [0.25, 0.25, 0.25, 0.25]
+    states[:, 0] = np.random.choice([0, 1, 2, 3], size=N, p=initial_dist)
+    
+    # Gentler activation
+    time_norm = np.linspace(-1, 3, T)
+    p_activate = 0.15 + 0.25 / (1 + np.exp(-time_norm))
+    
+    for t in range(1, T):
+        for i in range(N):
+            current = states[i, t-1]
+            
+            if current == 0:
+                if np.random.rand() < p_activate[t]:
+                    states[i, t] = 1
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 0
+                    tenure[i] += 1
+            elif current == 1:
+                # Upgrade to Regular
+                if tenure[i] > 4 and np.random.rand() < 0.50:
+                    states[i, t] = 2
+                    tenure[i] = 0
+                elif np.random.rand() < 0.08:
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 1
+                    tenure[i] += 1
+            elif current == 2:
+                # Upgrade to Heavy
+                if tenure[i] > 6 and np.random.rand() < 0.40:
+                    states[i, t] = 3
+                    tenure[i] = 0
+                elif np.random.rand() < 0.06:
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 2
+                    tenure[i] += 1
+            elif current == 3:
+                # Sticky Heavy
+                if np.random.rand() < 0.04:
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 3
+                    tenure[i] += 1
+        
+        obs[:, t] = generate_3mode_observations(N, states[:, t])
+        churned = (states[:, t] == 0) & (states[:, t-1] != 0)
+        tenure[churned] = 0
+
+    true_params = {
+        'DGP_type': '3Mode',
+        'state_zero_probs': {0: 1.0, 1: 0.80, 2: 0.50, 3: 0.30},
+        'state_gamma_params': {1: (1, 1), 2: (4, 2), 3: (10, 3)},
+        'transitions': 'tenure_based_3state'
+    }
+    
+    return _package_results(N, T, states, obs, true_params, seed)
+
+
+def generate_3mode_observations(n, state, state_zero_probs=None):
+    """3-MODE: State-dependent Gamma emissions WITH zero-inflation."""
+    if state_zero_probs is None:
+        state_zero_probs = {0: 1.0, 1: 0.80, 2: 0.50, 3: 0.30}
+    
+    result = np.zeros(n)
+    
+    for s in [0, 1, 2, 3]:
+        mask = state == s
+        if mask.sum() > 0:
+            if s == 0:
+                result[mask] = 0.0
+            else:
+                n_s = mask.sum()
+                is_zero = np.random.rand(n_s) < state_zero_probs[s]
+                result_s = np.zeros(n_s)
+                
+                n_pos = (~is_zero).sum()
+                if n_pos > 0:
+                    if s == 1:
+                        result_s[~is_zero] = np.random.gamma(1, 1, n_pos)
+                    elif s == 2:
+                        result_s[~is_zero] = np.random.gamma(4, 2, n_pos)
+                    elif s == 3:
+                        result_s[~is_zero] = np.random.gamma(10, 3, n_pos)
+                
+                result[mask] = result_s
+    
+    return result
+
+## ------
+
+def generate_4mode_panel(n_customers=200, n_periods=80, seed=42, **kwargs):
+    """Extreme 4-mode DGP with tenure-based upgrades."""
+    np.random.seed(seed)
+    N, T = n_customers, n_periods
+    
+    # Activation curve
+    time_norm = np.linspace(-4, 4, T)
+    p_activate = 0.05 + 0.4 / (1 + np.exp(-time_norm + 2))
+    
+    states = np.zeros((N, T), dtype=int)
+    obs = np.zeros((N, T))
+    tenure = np.zeros(N, dtype=int)
+    
+    for t in range(T):
+        for i in range(N):
+            current = states[i, t-1] if t > 0 else 0
+            
+            if current == 0:
+                if np.random.rand() < p_activate[t]:
+                    states[i, t] = 1
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 0
+                    tenure[i] += 1
+            elif current == 1:
+                if tenure[i] > 3 and np.random.rand() < 0.3:
+                    states[i, t] = 2
+                    tenure[i] = 0
+                elif np.random.rand() < 0.15:
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 1
+                    tenure[i] += 1
+            elif current == 2:
+                if tenure[i] > 5 and np.random.rand() < 0.25:
+                    states[i, t] = 3
+                    tenure[i] = 0
+                elif np.random.rand() < 0.20:
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 2
+                    tenure[i] += 1
+            elif current == 3:
+                if tenure[i] > 7 and np.random.rand() < 0.20:
+                    states[i, t] = 4
+                    tenure
+                else:
+                    states[i, t] = 3
+                    tenure[i] += 1
+            elif current == 4:
+                if np.random.rand() < 0.10:
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 4
+                    tenure[i] += 1
+        
+        # Generate observations based on state
+        obs[:, t] = generate_4mode_observations(N, states[:, t], 
+        state_zero_probs={0: 1.0, 1: 0.85, 2: 0.60, 3: 0.40, 4: 0.25})
+       
+        # Reset tenure for those who churned
+        churned = (states[:, t] == 0) & (states[:, t-1] != 0) if t > 0 else np.zeros(N, dtype=bool)
+        tenure[churned] = 0
+
+        true_params = {
+            'DGP_type': '4Mode',
+            'state_zero_probs': {0: 1.0, 1: 0.85, 2: 0.60, 3: 0.40, 4: 0.25},
+            'state_gamma_params': {1: (1, 0.5), 2: (5, 1), 3: (10, 2), 4: (15, 3)},
+            'transitions': 'tenure-based upgrades'
+        }    
+    return _package_results(N, T, states, obs, true_params, seed)
+
+def generate_4mode_panel_v2(n_customers=200, n_periods=80, seed=42, **kwargs):
+    """4-MODE DGP v2: Start spread out, stay in high states longer."""
+    np.random.seed(seed)
+    N, T = n_customers, n_periods
+    
+    # Start with spread initialization, not all in state 0
+    states = np.zeros((N, T), dtype=int)
+    obs = np.zeros((N, T))
+    tenure = np.zeros(N, dtype=int)
+    
+    # Initial distribution: 20% each in states 1-4, 20% in state 0
+    initial_dist = [0.2, 0.2, 0.2, 0.2, 0.2]
+    states[:, 0] = np.random.choice([0, 1, 2, 3, 4], size=N, p=initial_dist)
+    
+    # Activation curve (less aggressive, more stable)
+    time_norm = np.linspace(-2, 2, T)
+    p_activate = 0.1 + 0.2 / (1 + np.exp(-time_norm))
+    
+    for t in range(1, T):
+        for i in range(N):
+            current = states[i, t-1]
+            
+            if current == 0:
+                # Reactivation
+                if np.random.rand() < p_activate[t]:
+                    states[i, t] = 1
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 0
+                    tenure[i] += 1
+            elif current == 1:
+                # Longer tenure before upgrade, less churn
+                if tenure[i] > 5 and np.random.rand() < 0.4:  # Was 3, 0.3
+                    states[i, t] = 2
+                    tenure[i] = 0
+                elif np.random.rand() < 0.08:  # Was 0.15
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 1
+                    tenure[i] += 1
+            elif current == 2:
+                if tenure[i] > 7 and np.random.rand() < 0.35:  # Was 5, 0.25
+                    states[i, t] = 3
+                    tenure[i] = 0
+                elif np.random.rand() < 0.10:  # Was 0.20
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 2
+                    tenure[i] += 1
+            elif current == 3:
+                # STICKY high state - hard to leave
+                if tenure[i] > 10 and np.random.rand() < 0.30:  # Was 7, 0.20
+                    states[i, t] = 4
+                    tenure[i] = 0
+                elif np.random.rand() < 0.05:  # Was higher
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 3
+                    tenure[i] += 1
+            elif current == 4:
+                # SUPER STICKY - whales stay whales
+                if np.random.rand() < 0.03:  # Very rare churn
+                    states[i, t] = 0
+                    tenure[i] = 0
+                else:
+                    states[i, t] = 4
+                    tenure[i] += 1
+        
+        obs[:, t] = generate_4mode_observations(N, states[:, t])
+        churned = (states[:, t] == 0) & (states[:, t-1] != 0)
+        tenure[churned] = 0
+
+    true_params = {
+        'DGP_type': '4Mode_v2',
+        'state_zero_probs': {0: 1.0, 1: 0.85, 2: 0.60, 3: 0.40, 4: 0.25},
+        'state_gamma_params': {1: (1, 0.5), 2: (5, 1), 3: (10, 2), 4: (15, 3)},
+        'transitions': 'sticky_high_states'
+    }
+    
+    return _package_results(N, T, states, obs, true_params, seed)
+
+## ---
+
+def generate_moment_controlled_panel(n_customers=500, n_periods=100,
+                                     target_pi0=0.75, target_mu=45.0, target_cv=2.0,
+                                     n_states=3, seed=42, **kwargs):
+    """
+    3-State Gamma Mixture HMM with exact marginal moment matching.
+    
+    Uses stationary distribution + linear system solver for state parameters,
+    then Gamma parameters to match target CV.
+    """
+    import scipy.linalg
+    np.random.seed(seed)
+    N, T = n_customers, n_periods
+    
+    # --- 1. TRANSITION MATRIX (with Dead state as index 0) ---
+    # Sticky diagonal, proportional off-diagonals
+    Gamma = np.eye(n_states + 1) * 0.85
+    Gamma[0, 0] = 0.90  # Dead state very sticky
+    
+    # Off-diagonal: proportional to active time
+    off_diag = 0.15 / n_states
+    Gamma += (np.ones((n_states+1, n_states+1)) - np.eye(n_states+1)) * off_diag
+    Gamma /= Gamma.sum(axis=1, keepdims=True)
+    
+    # --- 2. STATIONARY DISTRIBUTION ---
+    # Solve delta * Gamma = delta
+    evals, evecs = scipy.linalg.eig(Gamma.T)
+    delta = evecs[:, np.isclose(evals, 1.0)].real
+    delta = (delta / delta.sum()).flatten()
+    
+    prob_dead = delta[0]
+    delta_active = delta[1:] / delta[1:].sum()  # Relative weights among active
+    
+    # --- 3. SOLVE STATE PARAMETERS FOR TARGET MOMENTS ---
+    # Anchors: State 1 (Dormant), State 3 (Whale) fixed
+    # State 2 (Core) solved to hit targets
+    
+    anchors = {
+        's1': (0.90, 2.0),    # Dormant: 90% zeros, $2 mean
+        's3': (0.20, 120.0)   # Whale: 20% zeros, $120 mean
+    }
+    
+    s1_pi0, s1_mu = anchors['s1']
+    s3_pi0, s3_mu = anchors['s3']
+    
+    # Solve for State 2 (Core) zero-inflation
+    # target_pi0 = delta[0]*1.0 + delta[1]*s1_pi0 + delta[2]*s2_pi0 + delta[3]*s3_pi0
+    s2_pi0 = (target_pi0 - prob_dead - delta[1]*s1_pi0 - delta[3]*s3_pi0) / delta[2]
+    s2_pi0 = np.clip(s2_pi0, 0.05, 0.95)
+    
+    # Solve for State 2 (Core) mean
+    # target_mu = weighted average of active state means
+    numerator = target_mu * (1 - target_pi0)
+    term1 = delta[1] * (1 - s1_pi0) * s1_mu
+    term3 = delta[3] * (1 - s3_pi0) * s3_mu
+    
+    s2_mu = (numerator - term1 - term3) / (delta[2] * (1 - s2_pi0))
+    s2_mu = max(s2_mu, 1.0)
+    
+    # Collect state parameters
+    pi_states = [s1_pi0, s2_pi0, s3_pi0]
+    mu_states = [s1_mu, s2_mu, s3_mu]
+    
+    # --- 4. SOLVE GAMMA PARAMETERS FOR TARGET CV ---
+    # Target variance for active observations
+    target_var_active = (target_cv * target_mu) ** 2
+    
+    # Distribute variance across states proportional to their contribution to mean
+    contributions = [delta[i+1] * (1 - pi_states[i]) * mu_states[i] 
+                     for i in range(n_states)]
+    total_contrib = sum(contributions)
+    
+    state_vars = [target_var_active * (c / total_contrib) for c in contributions]
+    
+    # Gamma: shape = mu^2 / var, scale = var / mu
+    gamma_shapes = [mu**2 / max(var, 0.1) for mu, var in zip(mu_states, state_vars)]
+    gamma_scales = [var / mu for mu, var in zip(mu_states, state_vars)]
+    
+    # --- 5. GENERATE PANEL ---
+    states = np.zeros((N, T), dtype=int)
+    obs = np.zeros((N, T))
+    
+    # Initialize from stationary distribution
+    states[:, 0] = np.random.choice(n_states + 1, size=N, p=delta)
+    
+    for t in range(T):
+        for i in range(N):
+            s = states[i, t]
+            
+            if s == 0:
+                # Dead state
+                obs[i, t] = 0.0
+            else:
+                # Active state (index 0 in params = state 1)
+                idx = s - 1
+                if np.random.rand() < pi_states[idx]:
+                    obs[i, t] = 0.0
+                else:
+                    obs[i, t] = np.random.gamma(gamma_shapes[idx], gamma_scales[idx])
+        
+        # Transition
+        if t < T - 1:
+            for i in range(N):
+                states[i, t+1] = np.random.choice(n_states + 1, 
+                                                   p=Gamma[states[i, t], :])
+    
+    # --- 6. VALIDATION ---
+    actual_pi0 = np.mean(obs == 0)
+    active_obs = obs[obs > 0]
+    actual_mu = np.mean(active_obs) if len(active_obs) > 0 else 0
+    actual_cv = np.std(active_obs) / actual_mu if actual_mu > 0 else 0
+    
+    true_params = {
+        'DGP_type': 'MomentControlled',
+        'target_pi0': target_pi0,
+        'target_mu': target_mu,
+        'target_cv': target_cv,
+        'actual_pi0': actual_pi0,
+        'actual_mu': actual_mu,
+        'actual_cv': actual_cv,
+        'delta_stationary': delta.tolist(),
+        'Gamma': Gamma.tolist(),
+        'pi_states': pi_states,
+        'mu_states': mu_states,
+        'gamma_shapes': gamma_shapes,
+        'gamma_scales': gamma_scales
+    }
+    
+    print(f"Target: π₀={target_pi0:.2%}, μ={target_mu:.1f}, CV={target_cv:.2f}")
+    print(f"Actual: π₀={actual_pi0:.2%}, μ={actual_mu:.1f}, CV={actual_cv:.2f}")
+    print(f"States: Dormant(π₀={pi_states[0]:.0%}, μ=${mu_states[0]:.0f}), "
+          f"Core(π₀={pi_states[1]:.0%}, μ=${mu_states[1]:.0f}), "
+          f"Whale(π₀={pi_states[2]:.0%}, μ=${mu_states[2]:.0f})")
+    
+    return _package_results(N, T, states, obs, true_params, seed)
+
+
+# =============================================================================
+# PACKAGING & OUTPUT
+# =============================================================================
+
+def _package_results(N, T, states, obs, true_params, seed):
+    """Package simulation results into standardized format."""
+    
+    # Compute RFM metrics
+    recency = np.zeros(N, dtype=int)
+    frequency = np.zeros(N, dtype=int)
+    monetary = np.zeros(N)
+    
+    for i in range(N):
+        purchases = obs[i, :] > 0
+        if purchases.any():
+            last_purchase_idx = np.where(purchases)[0][-1]
+            recency[i] = T - 1 - last_purchase_idx
+            frequency[i] = purchases.sum()
+            monetary[i] = obs[i, purchases].mean()
+    
+    results = {
+        'N': N,
+        'T': T,
+        'seed': seed,
+        'states': states,
+        'observations': obs,
+        'recency': recency,
+        'frequency': frequency,
+        'monetary': monetary,
+        'true_params': true_params,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    return results
+
+
+def save_simulation(results, output_path=None):
+    """Save simulation to pickle file."""
+    
+    dgp_type = results['true_params']['DGP_type'].lower()
+    N = results['N']
+    T = results['T']
+    seed = results['seed']
+    
+    if output_path is None:
+        output_path = f"sim_{dgp_type}_N{N}_T{T}_seed{seed}.pkl"
+    
+    with open(output_path, 'wb') as f:
+        pickle.dump(results, f)
+    
+    print(f"Saved: {output_path}")
+    print(f"  DGP: {results['true_params']['DGP_type']}")
+    print(f"  Customers: {N}, Periods: {T}")
+    print(f"  Seed: {seed}")
+    print(f"  Avg Frequency: {results['frequency'].mean():.2f}")
+    print(f"  Avg Monetary: {results['monetary'].mean():.2f}")
+    print(f"  Zero rate: {(results['observations'] == 0).mean():.2%}")
+    
+    return output_path
+
+
+def save_simulation_csv(results, output_path=None):
+    """Save simulation to CSV format for smc_unified_new.py compatibility."""
+    N, T = results['N'], results['T']
+    obs = results['observations']
+    
+    dgp_type = results['true_params']['DGP_type'].lower()
+    seed = results['seed']
+    
+    if output_path is None:
+        output_path = f"sim_{dgp_type}_N{N}_T{T}_seed{seed}.csv"
+    
+    # Write long-format CSV
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['customer_id', 'time_period', 'y'])
+        
+        for i in range(N):
+            for t in range(T):
+                writer.writerow([i, t, obs[i, t]])
+    
+    print(f"Saved CSV: {output_path}")
+    print(f"  Rows: {N * T}, Customers: {N}, Periods: {T}")
+    
+    return output_path
+
+
+def load_simulation(input_path):
+    """Load simulation from pickle file."""
+    with open(input_path, 'rb') as f:
+        results = pickle.load(f)
+    return results
+
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate synthetic RFM panel')
-    parser.add_argument('--dgp', type=str, default='mixture', 
-                        choices=['mixture', 'bimodal'],
-                        help='DGP type: mixture (unimodal) or bimodal (extreme)')
-    parser.add_argument('--n_customers', type=int, default=500)
-    parser.add_argument('--n_periods', type=int, default=100)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--output_pkl', type=str, default=None)
-    parser.add_argument('--output_csv', type=str, default=None)
-    
-    # DGP-specific params
+    parser = argparse.ArgumentParser(description='Generate synthetic RFM panel data')
+    parser.add_argument('--n_customers', type=int, default=100,
+                       help='Number of customers (default: 100)')
+    parser.add_argument('--n_periods', type=int, default=60,
+                       help='Number of time periods (default: 60)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (default: 42)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output file path (optional)')
     parser.add_argument('--zero_prob', type=float, default=None,
-                        help='Zero probability in active state (default: 0.70 mixture, 0.60 bimodal)')
+                       help='Zero-inflation probability (DGP-specific default if not set)')
     parser.add_argument('--gamma_shape', type=float, default=2.0,
-                        help='[Mixture only] Gamma shape')
+                       help='Gamma shape parameter (mixture DGP only)')
     parser.add_argument('--gamma_scale', type=float, default=4.0,
-                        help='[Mixture only] Gamma scale')
-    
+                       help='Gamma scale parameter (mixture DGP only)')
+    parser.add_argument('--format', type=str, default='pkl', choices=['pkl', 'csv', 'both'],
+                   help='Output format (default: pkl)')    
+    parser.add_argument('--dgp', choices=['mixture', 'bimodal', '4mode', '4mode_v2', '3mode', 'moment_controlled'])
+    parser.add_argument('--target_pi0', type=float, default=0.75)
+    parser.add_argument('--target_mu', type=float, default=45.0)
+    parser.add_argument('--target_cv', type=float, default=2.0)
+
     args = parser.parse_args()
     
-    # Set defaults based on DGP type
+    # Set DGP-specific defaults
     if args.zero_prob is None:
-        args.zero_prob = 0.60 if args.dgp == 'bimodal' else 0.70
+        if args.dgp == 'mixture':
+            args.zero_prob = 0.70
+        elif args.dgp == 'bimodal':
+            args.zero_prob = 0.60
+        else:
+            args.zero_prob = 0.50
     
-    # Auto-generate output names if not specified
-    if args.output_pkl is None:
-        args.output_pkl = f'ground_truth_{args.dgp}.pkl'
-    if args.output_csv is None:
-        args.output_csv = f'simulation_{args.dgp}_rfm.csv'
-    
-    print("="*70)
-    print(f"GENERATING {args.dgp.upper()} DGP")
-    print("="*70)
-    print(f"Customers: {args.n_customers}, Periods: {args.n_periods}")
-    print(f"Zero prob: {args.zero_prob}")
-    if args.dgp == 'mixture':
-        print(f"Positive: Gamma({args.gamma_shape}, {args.gamma_scale})")
-    else:
-        print(f"Positive: 50% Gamma(1,1) + 50% Gamma(10,2) [BIMODAL]")
-    print(f"Seed: {args.seed}")
-    print("="*70)
-    
-    # Generate
+# Generate
     kwargs = {
         'zero_prob': args.zero_prob,
-        'burn_in': 5
+        'gamma_shape': args.gamma_shape,
+        'gamma_scale': args.gamma_scale
     }
+    
     if args.dgp == 'mixture':
-        kwargs.update({
-            'gamma_shape': args.gamma_shape,
-            'gamma_scale': args.gamma_scale
-        })
-    data = generate_panel(
-        dgp_type=args.dgp,
-        n_customers=args.n_customers,
-        n_periods=args.n_periods,
-        seed=args.seed,
-        burn_in=5,  # Pass separately
-        **obs_kwargs  # Only zero_prob, gamma_shape, gamma_scale
-    )
+        results = generate_mixture_panel(args.n_customers, args.n_periods, args.seed, **kwargs)
+    elif args.dgp == 'bimodal':
+        results = generate_bimodal_panel(args.n_customers, args.n_periods, args.seed, **kwargs)
+    elif args.dgp == '4mode':
+        results = generate_4mode_panel(args.n_customers, args.n_periods, args.seed, **kwargs)
+    elif args.dgp == '4mode_v2':
+        results = generate_4mode_panel_v2(args.n_customers, args.n_periods, args.seed, **kwargs)
+    elif args.dgp == '3mode':
+        results = generate_3mode_panel(args.n_customers, args.n_periods, args.seed, **kwargs)
+    elif args.dgp == 'moment_controlled':
+        results = generate_moment_controlled_panel(
+            args.n_customers, args.n_periods,
+            target_pi0=args.target_pi0,
+            target_mu=args.target_mu,
+            target_cv=args.target_cv,
+            seed=args.seed, **kwargs
+        )
+
+    # Save based on format
+    if args.format in ['pkl', 'both']:
+        pkl_path = args.output or f"sim_{args.dgp}_N{args.n_customers}_T{args.n_periods}_seed{args.seed}.pkl"
+        save_simulation(results, pkl_path)
     
-    # Save
-    with open(args.output_pkl, 'wb') as f:
-        pickle.dump(data, f, protocol=4)
-    print(f"\nSaved: {args.output_pkl}")
-    
-    # Summary
-    print(f"\nGround Truth:")
-    dead_pct = 100 * (data['states_matrix'] == 0).mean()
-    active_pct = 100 * (data['states_matrix'] == 1).mean()
-    print(f"  Dead: {dead_pct:.1f}%, Active: {active_pct:.1f}%")
-    
-    n_activated = (data['true_switch_day'] >= 0).sum()
-    print(f"  Activated: {n_activated}/{data['N']} ({100*n_activated/data['N']:.1f}%)")
-    
-    save_to_rfm_csv(data, args.output_csv)
-    
-    print("\n" + "="*70)
-    if args.dgp == 'bimodal':
-        print("BIMODAL DGP: Tests if Tweedie-HMM beats NBD on extreme data")
-    else:
-        print("MIXTURE DGP: Standard test with high zero-inflation")
-    print("="*70)
+    if args.format in ['csv', 'both']:
+        csv_path = args.output.replace('.pkl', '.csv') if args.output and args.output.endswith('.pkl') else None
+        if csv_path is None:
+            csv_path = f"sim_{args.dgp}_N{args.n_customers}_T{args.n_periods}_seed{args.seed}.csv"
+        save_simulation_csv(results, csv_path)
+
 
 if __name__ == "__main__":
     main()

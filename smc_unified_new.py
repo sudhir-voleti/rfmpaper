@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""
-smc_unified_new.py
 ==================
 Complete working HMM/Static models: Tweedie, Hurdle, Poisson (discrete), NBD (discrete)
 Optimized for Apple Silicon (M1/M2/M3)
@@ -18,6 +15,9 @@ os.environ['PYTENSOR_FLAGS'] = 'floatX=float32,optimizer=fast_run,openmp=True'
 import pytensor
 import numpy as np
 import pytensor.tensor as pt
+
+import pathlib
+from pathlib import Path
 
 print(f"PyTensor config: floatX={pytensor.config.floatX}, optimizer={pytensor.config.optimizer}")
 os.environ['PYTENSOR_METAL'] = '0'
@@ -49,6 +49,7 @@ np.random.seed(RANDOM_SEED)
 IS_APPLE_SILICON = platform.machine() == 'arm64' and platform.system() == 'Darwin'
 if IS_APPLE_SILICON:
     print(f"Detected Apple Silicon ({platform.machine()}). Float32 optimization enabled.")
+
 
 # =============================================================================
 # 1. B-SPLINE BASIS FUNCTION
@@ -101,7 +102,7 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N)}) as model:
+    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:    
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
@@ -118,7 +119,8 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
             beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
             beta0 = pm.Deterministic("beta0", pt.sort(beta0_raw))
             phi_raw = pm.Exponential("phi_raw", lam=10.0, shape=K)
-            phi = pm.Deterministic("phi", pt.sort(phi_raw))
+            #phi = pm.Deterministic("phi", pt.sort(phi_raw))
+            phi = pm.Deterministic("phi", phi_raw) # Don't force sorting here
 
         if use_gam:
             if K == 1:
@@ -168,68 +170,122 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
 
         mu = pt.clip(mu, 1e-3, 1e6)
 
+        # --- 1. PARAMETER EXPANSION & STABLE EMISSION ---
         if K == 1:
             p_exp = p
             phi_exp = phi
-            exponent = 2.0 - p_exp
-            psi = pt.exp(-pt.pow(mu, exponent) / (phi_exp * exponent))
-            psi = pt.clip(psi, 1e-12, 1 - 1e-12)
-            log_zero = pt.log(psi)
-            log_pos = pt.log1p(-psi) + gamma_logp_det(y, mu, phi_exp)
-            log_emission = pt.where(y == 0, log_zero, log_pos)
-            log_emission = pt.where(mask, log_emission, 0.0)
+            y_input = y
+            mask_input = mask
         else:
             p_exp = p[None, None, :]
             phi_exp = phi[None, None, :]
-            exponent = 2.0 - p_exp
-            psi = pt.exp(-pt.pow(mu, exponent) / (phi_exp * exponent))
-            psi = pt.clip(psi, 1e-12, 1 - 1e-12)
-            log_zero = pt.log(psi)
-            y_exp = y[..., None]
-            log_pos = pt.log1p(-psi) + gamma_logp_det(y_exp, mu, phi_exp)
-            log_emission = pt.where(y_exp == 0, log_zero, log_pos)
-            log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
+            y_input = y[..., None]
+            mask_input = mask[:, :, None]
 
+        exponent = 2.0 - p_exp
+        
+        # Stable log-space calculation for Tweedie zero-mass
+        # log_psi = - (mu^(2-p)) / (phi * (2-p))
+        log_psi = -(pt.pow(mu, exponent) / (phi_exp * exponent))
+        log_psi = pt.clip(log_psi, -100, -1e-12) # Prevents inf and stabilizes log_pos
+        
+        log_zero = log_psi
+        # Stable log(1 - exp(x)) using log(-expm1(x))
+        log_pos = pt.log(-pt.expm1(log_psi)) + gamma_logp_det(y_input, mu, phi_exp)
+        
+        log_emission = pt.where(y_input == 0, log_zero, log_pos)
+        log_emission = pt.where(mask_input, log_emission, 0.0) 
+
+
+        # --- 2. FORWARD ALGORITHM (HMM INTEGRATION) ---
         if K == 1:
             logp_cust = pt.sum(log_emission, axis=1)
+            # Placeholder for K=1 consistency
+            alpha_filtered = pt.ones((N, T, 1))
         else:
+            # Initialize: P(S_0 | y_0)
             log_alpha = pt.log(pi0) + log_emission[:, 0, :]
             log_Gamma = pt.log(Gamma)[None, :, :]
+            
+            alpha_seq = [log_alpha]
+            
+            # Recursive pass
             for t in range(1, T):
+                # temp = log P(S_{t-1} | y_{0:t-1}) + log P(S_t | S_{t-1})
                 temp = log_alpha[:, :, None] + log_Gamma
+                # log_alpha = log P(y_t | S_t) + log sum(temp)
                 log_alpha = log_emission[:, t, :] + pt.logsumexp(temp, axis=1)
+                alpha_seq.append(log_alpha)
+            
+            # Stack and Normalize to get P(S_t | y_{0:t})
+            log_alpha_stacked = pt.stack(alpha_seq, axis=1)
+            alpha_filtered = pt.exp(log_alpha_stacked - pt.logsumexp(log_alpha_stacked, axis=2, keepdims=True))
+            
+            # Total log-likelihood for the customer is the logsumexp of the final alpha
             logp_cust = pt.logsumexp(log_alpha, axis=1)
+
+        # --- 3. DETERMINISTICS & POTENTIAL ---
+        if K > 1:
+            pm.Deterministic('alpha_filtered', alpha_filtered, dims=('customer', 'time', 'state'))
 
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
-        # === ADD THIS BLOCK ===
-        # Compute Viterbi path for state recovery evaluation
+
+
+        # --- VITERBI BACKTRACK (MOST LIKELY STATE PATH) ---
         if K > 1:
-            # Viterbi decoding (most likely state sequence)
+            # log_delta[t, k] = max_{s_{1:t-1}} log P(s_{1:t-1}, s_t=k, y_{1:t})
             log_delta = pt.log(pi0) + log_emission[:, 0, :]
-            psi = pt.zeros((N, T, K), dtype='int32')
+            log_Gamma = pt.log(Gamma)[None, :, :]
+            
+            # To backtrack, we need to store the argmax at each step
+            psi_list = []
             
             for t in range(1, T):
-                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
-                max_val = pt.max(temp, axis=1)
-                max_idx = pt.argmax(temp, axis=1)
-                log_delta = max_val
-                psi = pt.set_subtensor(psi[:, t, :], max_idx)
+                # We want: max over previous state 'j'
+                # log_delta (N, j) -> log_delta[:, :, None] (N, j, 1)
+                # log_Gamma (1, j, k)
+                # log_emission (N, k) -> log_emission[:, t, :][:, None, :] (N, 1, k)
+                
+                # Probability of arriving at state k via state j
+                p_matrix = log_delta[:, :, None] + log_Gamma
+                
+                # Which previous state j was the best for each current state k?
+                best_prev_state = pt.argmax(p_matrix, axis=1) # (N, K)
+                psi_list.append(best_prev_state)
+                
+                # Update log_delta for the next time step
+                log_delta = log_emission[:, t, :] + pt.max(p_matrix, axis=1)
+
+            # --- BACKTRACKING ---
+            # We start from the end and work backwards
+            viterbi_path_seq = []
             
-            # Backtrack to find Viterbi path
-            viterbi_path = pt.zeros((N, T), dtype='int32')
-            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
+            # The best final state for each customer
+            last_state = pt.argmax(log_delta, axis=1)
+            viterbi_path_seq.append(last_state)
             
-            # Store posterior state probabilities (marginal)
-            # Reshape to (N, T, K) for time-varying probabilities
-            #log_alpha_reshaped = log_alpha.reshape((N, T, K))
-            #post_probs = pt.exp(log_alpha_reshaped - pt.logsumexp(log_alpha_reshaped, axis=2, keepdims=True))
+            current_state = last_state
+            # Walk back through the stored psi (argmax) matrices
+            for t in range(T - 2, -1, -1):
+                # Use advanced indexing to pick the best prev state 
+                # for the current state we just found
+                # psi_list[t] has shape (N, K)
+                prev_state = psi_list[t][pt.arange(N), current_state]
+                viterbi_path_seq.append(prev_state)
+                current_state = prev_state
+
+            # Reverse the sequence (since we walked backwards) and stack
+            # Final shape: (N, T)
+            viterbi_path = pt.stack(viterbi_path_seq[::-1], axis=1)
             
-            pm.Deterministic('viterbi', viterbi_path)
-            #pm.Deterministic('post_probs', post_probs)
-        # === END ADD ===
+            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
+
         return model
+
+
+## ---
 
 def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
     """Hurdle-Gamma HMM model."""
@@ -254,7 +310,7 @@ def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N)}) as model:
+    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
@@ -401,13 +457,14 @@ def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
         return model
 
 
-
 def make_poisson_model(data, K=3, use_gam=True, gam_df=3):
-    """DISCRETE Poisson HMM - rounds y to integers."""
     N, T = data["N"], data["T"]
     y, mask = data["y"], data["mask"]
     R, F, M = data["R"], data["F"], data["M"]
     
+    print(f"DEBUG: y shape={y.shape}, mask shape={mask.shape}, R shape={R.shape}")
+    print(f"DEBUG: N={N}, T={T}")
+
     y_int = np.round(y).astype(np.int32)
 
     if use_gam and K >= 1:
@@ -427,7 +484,7 @@ def make_poisson_model(data, K=3, use_gam=True, gam_df=3):
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N)}) as model:
+    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
@@ -498,52 +555,34 @@ def make_poisson_model(data, K=3, use_gam=True, gam_df=3):
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
-        # === ADD THIS BLOCK ===
-        # Compute Viterbi path for state recovery evaluation
-        if K > 1:
-            # Viterbi decoding (most likely state sequence)
-            log_delta = pt.log(pi0) + log_emission[:, 0, :]
-            psi = pt.zeros((N, T, K), dtype='int32')
-            
-            for t in range(1, T):
-                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
-                max_val = pt.max(temp, axis=1)
-                max_idx = pt.argmax(temp, axis=1)
-                log_delta = max_val
-                psi = pt.set_subtensor(psi[:, t, :], max_idx)
-            
-            # Backtrack to find Viterbi path
-            viterbi_path = pt.zeros((N, T), dtype='int32')
-            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
-            
-            # Store posterior state probabilities (marginal)
-            # Approximate: use normalized forward probabilities
-            #post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
-            
-            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
-            #pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
-        # === END ADD ===
-
-        return model        
-
+        return model     
+   
 def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
-    """DISCRETE Negative Binomial HMM - rounds y to integers."""
+    """
+    Continuous-Extension Negative Binomial HMM.
+    Uses Gamma-function interpolation to allow fair comparison with 
+    semi-continuous Tweedie on non-integer spend data.
+    """
+    import pymc as pm
+    import pytensor.tensor as pt
+    import numpy as np
+
     N, T = data["N"], data["T"]
     y, mask = data["y"], data["mask"]
     R, F, M = data["R"], data["F"], data["M"]
     
-    y_int = np.round(y).astype(np.int32)
+    # Treat y as continuous float32 to match Tweedie precision
+    y_tensor = pt.as_tensor_variable(y).astype("float32")
+    eps = 1e-9 # Numerical stability epsilon
 
     if use_gam and K >= 1:
-        R_flat = R.flatten()
-        F_flat = F.flatten()
-        M_flat = M.flatten()
+        R_flat, F_flat, M_flat = R.flatten(), F.flatten(), M.flatten()
         basis_R = create_bspline_basis(R_flat, df=gam_df)
         basis_F = create_bspline_basis(F_flat, df=gam_df)
         basis_M = create_bspline_basis(M_flat, df=gam_df)
-        n_basis_R = basis_R.shape[1]
-        n_basis_F = basis_F.shape[1]
-        n_basis_M = basis_M.shape[1]
+        
+        n_basis_R, n_basis_F, n_basis_M = basis_R.shape[1], basis_F.shape[1], basis_M.shape[1]
+        
         basis_R = basis_R.reshape(N, T, n_basis_R)
         basis_F = basis_F.reshape(N, T, n_basis_F)
         basis_M = basis_M.reshape(N, T, n_basis_M)
@@ -551,7 +590,8 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N)}) as model:
+    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
+        # --- PRIORS: HMM Structure ---
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
@@ -559,40 +599,31 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
             pi0 = pm.Dirichlet("pi0", a=np.ones(K, dtype=np.float32))
             Gamma = pm.Dirichlet("Gamma", a=np.ones(K, dtype=np.float32), shape=(K, K))
 
-        if K == 1:
-            beta0 = pm.Normal("beta0", 0, 1)
-            alpha = pm.Exponential("alpha", lam=1.0)
-            if use_gam:
-                w_R = pm.Normal("w_R", 0, 1, shape=n_basis_R)
-                w_F = pm.Normal("w_F", 0, 1, shape=n_basis_F)
-                w_M = pm.Normal("w_M", 0, 1, shape=n_basis_M)
-            else:
-                betaR = pm.Normal("betaR", 0, 1)
-                betaF = pm.Normal("betaF", 0, 1)
-                betaM = pm.Normal("betaM", 0, 1)
-        else:
-            beta0 = pm.Normal("beta0", 0, 1, shape=K)
-            alpha = pm.Exponential("alpha", lam=1.0, shape=K)
-            if use_gam:
-                w_R = pm.Normal("w_R", 0, 1, shape=(K, n_basis_R))
-                w_F = pm.Normal("w_F", 0, 1, shape=(K, n_basis_F))
-                w_M = pm.Normal("w_M", 0, 1, shape=(K, n_basis_M))
-            else:
-                betaR = pm.Normal("betaR", 0, 1, shape=K)
-                betaF = pm.Normal("betaF", 0, 1, shape=K)
-                betaM = pm.Normal("betaM", 0, 1, shape=K)
+        # --- PRIORS: Emission Parameters ---
+        beta0 = pm.Normal("beta0", 0, 1, shape=(K,) if K > 1 else None)
+        alpha = pm.Exponential("alpha", lam=1.0, shape=(K,) if K > 1 else None)
 
         if use_gam:
+            w_R = pm.Normal("w_R", 0, 1, shape=(K, n_basis_R) if K > 1 else n_basis_R)
+            w_F = pm.Normal("w_F", 0, 1, shape=(K, n_basis_F) if K > 1 else n_basis_F)
+            w_M = pm.Normal("w_M", 0, 1, shape=(K, n_basis_M) if K > 1 else n_basis_M)
+        else:
+            betaR = pm.Normal("betaR", 0, 1, shape=(K,) if K > 1 else None)
+            betaF = pm.Normal("betaF", 0, 1, shape=(K,) if K > 1 else None)
+            betaM = pm.Normal("betaM", 0, 1, shape=(K,) if K > 1 else None)
+
+        # --- LOG-MU CALCULATION (Link Function) ---
+        if use_gam:
             if K == 1:
-                effect_R = pt.tensordot(basis_R, w_R, axes=([2], [0]))
-                effect_F = pt.tensordot(basis_F, w_F, axes=([2], [0]))
-                effect_M = pt.tensordot(basis_M, w_M, axes=([2], [0]))
-                log_mu = beta0 + effect_R + effect_F + effect_M
+                eR = pt.tensordot(basis_R, w_R, axes=([2], [0]))
+                eF = pt.tensordot(basis_F, w_F, axes=([2], [0]))
+                eM = pt.tensordot(basis_M, w_M, axes=([2], [0]))
+                log_mu = beta0 + eR + eF + eM
             else:
-                effect_R = pt.tensordot(basis_R, w_R, axes=([2], [1]))
-                effect_F = pt.tensordot(basis_F, w_F, axes=([2], [1]))
-                effect_M = pt.tensordot(basis_M, w_M, axes=([2], [1]))
-                log_mu = beta0 + effect_R + effect_F + effect_M
+                eR = pt.tensordot(basis_R, w_R, axes=([2], [1]))
+                eF = pt.tensordot(basis_F, w_F, axes=([2], [1]))
+                eM = pt.tensordot(basis_M, w_M, axes=([2], [1]))
+                log_mu = beta0 + eR + eF + eM
         else:
             if K == 1:
                 log_mu = beta0 + betaR * R + betaF * F + betaM * M
@@ -601,27 +632,31 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
 
         mu = pt.exp(pt.clip(log_mu, -10, 10))
 
-        y_tensor = pt.as_tensor_variable(y_int)
+        # --- CONTINUOUS NBD LIKELIHOOD ---
         if K == 1:
             term1 = pt.gammaln(y_tensor + alpha)
-            term2 = pt.gammaln(y_tensor + 1)
+            term2 = pt.gammaln(y_tensor + 1.0)
             term3 = pt.gammaln(alpha)
-            term4 = alpha * pt.log(alpha / (mu + alpha))
-            term5 = y_tensor * pt.log(mu / (mu + alpha))
-            log_emission = term1 - term2 - term3 + term4 + term5
+            # Log-space stability for p and q
+            log_p = pt.log(alpha) - pt.log(mu + alpha + eps)
+            log_q = pt.log(mu + eps) - pt.log(mu + alpha + eps)
+            log_emission = term1 - term2 - term3 + (alpha * log_p) + (y_tensor * log_q)
             log_emission = pt.where(mask, log_emission, 0.0)
         else:
             alpha_exp = alpha[None, None, :]
-            mu_exp = mu[..., None]
+            mu_exp = mu[..., None] if use_gam else mu # mu already (N,T,K) if not GAM? No, check dims
             y_exp = y_tensor[..., None]
+            
             term1 = pt.gammaln(y_exp + alpha_exp)
-            term2 = pt.gammaln(y_exp + 1)
+            term2 = pt.gammaln(y_exp + 1.0)
             term3 = pt.gammaln(alpha_exp)
-            term4 = alpha_exp * pt.log(alpha_exp / (mu_exp + alpha_exp))
-            term5 = y_exp * pt.log(mu_exp / (mu_exp + alpha_exp))
-            log_emission = term1 - term2 - term3 + term4 + term5
+            log_p = pt.log(alpha_exp) - pt.log(mu_exp + alpha_exp + eps)
+            log_q = pt.log(mu_exp + eps) - pt.log(mu_exp + alpha_exp + eps)
+            
+            log_emission = term1 - term2 - term3 + (alpha_exp * log_p) + (y_exp * log_q)
             log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
 
+        # --- FORWARD PASS (HMM INTEGRATION) ---
         if K == 1:
             logp_cust = pt.sum(log_emission, axis=1)
         else:
@@ -635,37 +670,122 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
-        # === ADD THIS BLOCK ===
-        # Compute Viterbi path for state recovery evaluation
-        if K > 1:
-            # Viterbi decoding (most likely state sequence)
-            log_delta = pt.log(pi0) + log_emission[:, 0, :]
-            psi = pt.zeros((N, T, K), dtype='int32')
-            
-            for t in range(1, T):
-                temp = log_delta[:, :, None] + log_Gamma + log_emission[:, t, :][:, None, :]
-                max_val = pt.max(temp, axis=1)
-                max_idx = pt.argmax(temp, axis=1)
-                log_delta = max_val
-                psi = pt.set_subtensor(psi[:, t, :], max_idx)
-            
-            # Backtrack to find Viterbi path
-            viterbi_path = pt.zeros((N, T), dtype='int32')
-            viterbi_path = pt.set_subtensor(viterbi_path[:, T-1], pt.argmax(log_delta, axis=1))
-            
-            # Store posterior state probabilities (marginal)
-            # Approximate: use normalized forward probabilities
-            #post_probs = pt.exp(log_alpha - pt.logsumexp(log_alpha, axis=1, keepdims=True))
-            
-            pm.Deterministic('viterbi', viterbi_path, dims=('customer', 'time'))
-            #pm.Deterministic('post_probs', post_probs, dims=('customer', 'time', 'state'))
-        # === END ADD ===
-
-        return model        
+    return model
 
 # =============================================================================
 # 4. DATA BUILDER
 # =============================================================================
+
+def compute_rfm_features(y, mask):
+    """Compute Recency, Frequency, Monetary features from panel data."""
+    N, T = y.shape
+    R = np.zeros((N, T), dtype=np.float32)
+    F = np.zeros((N, T), dtype=np.float32)
+    M = np.zeros((N, T), dtype=np.float32)
+    
+    for i in range(N):
+        last_purchase = -1
+        cumulative_freq = 0
+        cumulative_spend = 0.0
+        
+        for t in range(T):
+            if mask[i, t]:
+                if y[i, t] > 0:
+                    last_purchase = t
+                    cumulative_freq += 1
+                    cumulative_spend += y[i, t]
+                
+                if last_purchase >= 0:
+                    R[i, t] = t - last_purchase
+                    F[i, t] = cumulative_freq
+                    M[i, t] = cumulative_spend / cumulative_freq if cumulative_freq > 0 else 0.0
+                else:
+                    R[i, t] = t + 1  # No purchase yet
+                    F[i, t] = 0
+                    M[i, t] = 0.0
+            else:
+                R[i, t] = 0
+                F[i, t] = 0
+                M[i, t] = 0.0
+    
+    return R, F, M
+
+## ----
+	
+def load_simulation_data(data_path, n_cust=None, seed=42, train_frac=1.0):
+    """Load simulation from pkl or CSV file with optional train/test split."""
+    import pickle
+    import pandas as pd
+    
+    data_path = pathlib.Path(data_path)
+    
+    if data_path.suffix == '.pkl':
+        with open(data_path, 'rb') as f:
+            sim = pickle.load(f)
+        N_full, T = sim['N'], sim['T']
+        obs = sim['observations']
+        source = 'pkl'
+        
+    elif data_path.suffix == '.csv':
+        df = pd.read_csv(data_path)
+        df.columns = df.columns.str.strip()
+        N_full = df['customer_id'].nunique()
+        T = df['time_period'].nunique()
+        obs = df.pivot(index='customer_id', columns='time_period', values='y').values
+        source = 'csv'
+    else:
+        raise ValueError(f"Unknown format: {data_path.suffix}")
+    
+    # Subsample customers if requested
+    if n_cust is not None and n_cust < N_full:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(N_full, n_cust, replace=False)
+        obs = obs[idx, :]
+        N = n_cust
+    else:
+        N = N_full
+        idx = np.arange(N)
+    
+    # Train/test split on time dimension
+    T_train = int(T * train_frac)
+    
+    if train_frac < 1.0:
+        obs_train = obs[:, :T_train]
+        obs_test = obs[:, T_train:]
+    else:
+        obs_train = obs
+        obs_test = None
+    
+    # Build masks
+    mask_train = np.ones((N, T_train), dtype=bool)
+    
+    # Compute RFM on training data only
+    R_train, F_train, M_train = compute_rfm_features(obs_train, mask_train)
+    
+    data = {
+        'N': N,
+        'T': T_train,
+        'y': obs_train.astype(np.float32),
+        'mask': mask_train,
+        'R': R_train.astype(np.float32),
+        'F': F_train.astype(np.float32),
+        'M': M_train.astype(np.float32),
+        'customer_id': idx,
+        'time': np.arange(T_train),
+        'T_full': T,  # Original T
+        'T_test': T - T_train if train_frac < 1.0 else 0,
+    }
+    
+    if obs_test is not None:
+        data['y_test'] = obs_test.astype(np.float32)
+        data['mask_test'] = np.ones((N, T - T_train), dtype=bool)
+    
+    print(f"  Loaded: N={N}, T_train={T_train}, T_test={data.get('T_test', 0)}, "
+          f"zeros={np.mean(obs_train==0):.1%} (from {source})")
+    
+    return data
+
+## ----
 
 def build_panel_data(df_path, customer_col='customer_id', n_cust=None, seed=RANDOM_SEED):
     """Build panel data dictionary from CSV."""
@@ -764,12 +884,19 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
 
         elapsed = (time.time() - t0) / 60
 
+
         res = {
             'K': K, 'model_type': model_type, 'N': data['N'], 'T': data['T'],
             'use_gam': use_gam, 'gam_df': gam_df if use_gam else None,
             'log_evidence': log_ev, 'draws': draws, 'chains': chains,
             'time_min': elapsed, 'timestamp': time.strftime('%Y%m%d_%H%M%S')
         }
+
+        # Add test data if available
+        if 'y_test' in data:
+            res['y_test'] = data['y_test']
+            res['T_test'] = data['T_test']
+            res['mask_test'] = data.get('mask_test', None)
 
         p_tag = f"p{p_fixed}" if (model_type == 'tweedie' and not state_specific_p and K > 1) else "statep" if (state_specific_p and K > 1) else "discrete"
         pkl_path = out_dir / f"smc_K{K}_{model_type.upper()}_{'GAM' if use_gam else 'GLM'}_{p_tag}_N{data['N']}_D{draws}.pkl"
@@ -814,6 +941,8 @@ def main():
     parser = argparse.ArgumentParser(description='HMM/Static Models: Tweedie, Hurdle, Poisson, NBD')
     parser.add_argument('--dataset', required=True, choices=['uci', 'cdnow', 'simulation'])
     parser.add_argument('--data_dir', type=str, default='./data')
+    parser.add_argument('--sim_path', type=str, default=None,
+                       help='Path to simulation file (.csv or .pkl). Required if --dataset simulation')
     parser.add_argument('--n_cust', type=int, default=None)
     parser.add_argument('--K', type=int, default=3)
     parser.add_argument('--model_type', default='tweedie', choices=['tweedie', 'hurdle', 'poisson', 'nbd'])
@@ -825,17 +954,30 @@ def main():
     parser.add_argument('--chains', type=int, default=4)
     parser.add_argument('--out_dir', type=str, default='./results')
     parser.add_argument('--seed', type=int, default=RANDOM_SEED)
-
+    parser.add_argument('--train_frac', type=float, default=1.0,
+                   help='Fraction of time periods for training (default: 1.0 = no split)')
     args = parser.parse_args()
+
     data_dir = pathlib.Path(args.data_dir)
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*70}")
     print(f"SMC Unified: {args.dataset.upper()} | {args.model_type.upper()} | K={args.K}")
-    print(f"{'='*70}\n")
+    
+    if args.dataset == 'simulation':
+        if not args.sim_path:
+            raise ValueError("--sim_path required when --dataset simulation (e.g., --sim_path /path/to/file.csv or .pkl)")
+        
+        sim_path = pathlib.Path(args.sim_path)
+        if not sim_path.exists():
+            raise FileNotFoundError(f"Simulation file not found: {sim_path}")
 
-    data = build_panel_data(data_dir / f"{args.dataset}_full.csv", n_cust=args.n_cust, seed=args.seed)
+        data = load_simulation_data(sim_path, n_cust=args.n_cust, seed=args.seed, train_frac=args.train_frac)
+    else:
+        data = build_panel_data(data_dir / f"{args.dataset}_full.csv", n_cust=args.n_cust, seed=args.seed)
+    
+    print(f"{'='*70}\n")
     print(f"Loaded: N={data['N']}, T={data['T']}, zeros={np.mean(data['y']==0):.1%}\n")
 
     pkl_path, res = run_smc(data, args.K, args.model_type, args.state_specific_p,
@@ -844,6 +986,7 @@ def main():
 
     print(f"\nSaved: {pkl_path}")
     print(f"Log-Ev: {res['log_evidence']:.2f}, Time: {res['time_min']:.1f}min")
-
+    
+  
 if __name__ == "__main__":
     main()

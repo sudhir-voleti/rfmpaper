@@ -2,12 +2,15 @@
 """
 simulation_generator.py
 =======================
-Generate synthetic RFM panel data with known ground truth states.
-Supports multiple DGPs: mixture (unimodal) and bimodal.
+Generate synthetic RFM panel with selectable DGP:
+- mixture: Unimodal high zero-inflation
+- bimodal: Two-mode (low + whales)
+- 4mode: Extreme four-mode (Dead, Low, Med, High, Super)
 
 Usage:
     python simulation_generator.py --dgp mixture --n_customers 50 --n_periods 60
     python simulation_generator.py --dgp bimodal --n_customers 100 --n_periods 60
+    python simulation_generator.py --dgp 4mode --n_customers 200 --n_periods 80
 """
 
 import numpy as np
@@ -647,29 +650,47 @@ def save_simulation(results, output_path=None):
     return output_path
 
 
-def save_simulation_csv(results, output_path=None):
-    """Save simulation to CSV format for smc_unified_new.py compatibility."""
+def save_simulation_csv(results, output_path=None, include_state=False):
+    """Save simulation to CSV format for smc_unified_new.py compatibility.
+    
+    Args:
+        results: Simulation results dict
+        output_path: Output file path (optional)
+        include_state: If True, include true_state column for validation
+    """
     N, T = results['N'], results['T']
     obs = results['observations']
-    
+    states = results.get('states', None) if include_state else None
+
     dgp_type = results['true_params']['DGP_type'].lower()
     seed = results['seed']
-    
+
     if output_path is None:
-        output_path = f"sim_{dgp_type}_N{N}_T{T}_seed{seed}.csv"
-    
+        state_tag = "_withstate" if include_state else ""
+        output_path = f"sim_{dgp_type}_N{N}_T{T}_seed{seed}{state_tag}.csv"
+
     # Write long-format CSV
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['customer_id', 'time_period', 'y'])
         
+        # Header with optional state column
+        header = ['customer_id', 'time_period', 'y']
+        if include_state:
+            header.append('true_state')
+        writer.writerow(header)
+
         for i in range(N):
             for t in range(T):
-                writer.writerow([i, t, obs[i, t]])
-    
+                row = [i, t, obs[i, t]]
+                if include_state:
+                    row.append(int(states[i, t]) if states is not None else -1)
+                writer.writerow(row)
+
     print(f"Saved CSV: {output_path}")
-    print(f"  Rows: {N * T}, Customers: {N}, Periods: {T}")
-    
+    print(f" Rows: {N * T}, Customers: {N}, Periods: {T}")
+    if include_state:
+        print(f" Includes: true_state column")
+
     return output_path
 
 
@@ -706,6 +727,8 @@ def main():
     parser.add_argument('--target_pi0', type=float, default=0.75)
     parser.add_argument('--target_mu', type=float, default=45.0)
     parser.add_argument('--target_cv', type=float, default=2.0)
+    parser.add_argument('--include_state', action='store_true',
+                       help='Include true state in CSV output')
 
     args = parser.parse_args()
     
@@ -749,11 +772,16 @@ def main():
         pkl_path = args.output or f"sim_{args.dgp}_N{args.n_customers}_T{args.n_periods}_seed{args.seed}.pkl"
         save_simulation(results, pkl_path)
     
+
     if args.format in ['csv', 'both']:
-        csv_path = args.output.replace('.pkl', '.csv') if args.output and args.output.endswith('.pkl') else None
-        if csv_path is None:
-            csv_path = f"sim_{args.dgp}_N{args.n_customers}_T{args.n_periods}_seed{args.seed}.csv"
-        save_simulation_csv(results, csv_path)
+        if args.output:
+            # Use provided output path (change .pkl to .csv if needed)
+            csv_path = args.output.replace('.pkl', '.csv') if args.output.endswith('.pkl') else args.output
+        else:
+            # Default naming
+            state_tag = "_withstate" if args.include_state else ""
+            csv_path = f"sim_{args.dgp}_N{args.n_customers}_T{args.n_periods}_seed{args.seed}{state_tag}.csv"
+        save_simulation_csv(results, csv_path, include_state=True)
 
 
 if __name__ == "__main__":

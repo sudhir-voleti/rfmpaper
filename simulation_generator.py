@@ -2,8 +2,8 @@
 """
 simulation_generator.py
 =======================
-Generate synthetic RFM panel with principled 3-state mixture DGP (NOT Tweedie).
-Designed to test HMM-Tweedie recovery of latent regimes despite misspecification.
+Generate synthetic RFM panel with principled 3-state DGP + Dead state.
+Designed to test HMM-Tweedie recovery of heterogeneous regimes.
 """
 
 import numpy as np
@@ -16,15 +16,50 @@ import csv
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 # =============================================================================
-# 1. STATIONARY MOMENT SOLVER (corrected for Dead state π₀=1.0)
+# 1. WORLD PRESETS (2x2 Taxonomy)
 # =============================================================================
-def solve_stationary_moments(Gamma, target_mu, target_pi0, anchors, separation_factor=0.8):
+WORLD_PRESETS = {
+    'poisson': {
+        'target_pi0': 0.20, 
+        'target_mu': 50.0, 
+        'target_cv': 0.5,
+        'anchors': {'s1': (0.30, 30.0), 's3': (0.05, 80.0)},
+        'desc': 'Low zero, low variance — Loyalty program members'
+    },
+    'sporadic': {
+        'target_pi0': 0.75, 
+        'target_mu': 60.0, 
+        'target_cv': 0.8,
+        'anchors': {'s1': (0.90, 20.0), 's3': (0.20, 100.0)},
+        'desc': 'High zero, low variance — Seasonal subscriptions'
+    },
+    'gamma': {
+        'target_pi0': 0.30, 
+        'target_mu': 40.0, 
+        'target_cv': 3.0,
+        'anchors': {'s1': (0.50, 15.0), 's3': (0.10, 120.0)},
+        'desc': 'Low zero, high variance — VIP whales'
+    },
+    'clumpy': {
+        'target_pi0': 0.75, 
+        'target_mu': 45.0, 
+        'target_cv': 4.0,
+        'anchors': {'s1': (0.95, 5.0), 's3': (0.15, 150.0)},
+        'desc': 'High zero, high variance — Episodic heavy buyers'
+    }
+}
+
+# =============================================================================
+# 2. STATIONARY MOMENT SOLVER (4 states: Dead + 3 Active)
+# =============================================================================
+def solve_stationary_moments(Gamma: np.ndarray, target_mu: float, target_pi0: float, 
+                            anchors: Dict, separation: float = 0.8) -> Tuple:
     """
     Solve for state-specific pi0 and mu to match target aggregate moments.
-    Dead state (index 0) has pi0 = 1.0 by construction.
+    States: 0=Dead (pi0=1.0), 1=Cold, 2=Warm, 3=Hot
     """
     evals, evecs = scipy.linalg.eig(Gamma.T)
     delta = evecs[:, np.isclose(evals, 1.0, atol=1e-10)].real
@@ -33,116 +68,135 @@ def solve_stationary_moments(Gamma, target_mu, target_pi0, anchors, separation_f
     s1_pi0_base, s1_mu_base = anchors['s1']  # Cold
     s3_pi0_base, s3_mu_base = anchors['s3']  # Hot
     
-    s1_mu = target_mu + (s1_mu_base - target_mu) * separation_factor
-    s3_mu = target_mu + (s3_mu_base - target_mu) * separation_factor
-    s1_pi0 = target_pi0 + (s1_pi0_base - target_pi0) * separation_factor
-    s3_pi0 = target_pi0 + (s3_pi0_base - target_pi0) * separation_factor
+    # Apply separation factor
+    s1_mu = target_mu + (s1_mu_base - target_mu) * separation
+    s3_mu = target_mu + (s3_mu_base - target_mu) * separation
+    s1_pi0 = target_pi0 + (s1_pi0_base - target_pi0) * separation
+    s3_pi0 = target_pi0 + (s3_pi0_base - target_pi0) * separation
     
-    # Corrected: Dead state (0) contributes delta[0] * 1.0 to total pi0
-    s2_pi0 = (target_pi0 - delta[0] * 1.0 - delta[1] * s1_pi0 - delta[3] * s3_pi0) / delta[2]
+    # Solve for Warm state (index 2)
+    # Dead state (0) has pi0=1.0 exactly
+    s2_pi0 = (target_pi0 - delta[0]*1.0 - delta[1]*s1_pi0 - delta[3]*s3_pi0) / delta[2]
     s2_pi0 = np.clip(s2_pi0, 0.05, 0.95)
     
-    target_sum_mu = target_mu * (1 - target_pi0)
+    # Solve for Warm mu
+    target_active_spend = target_mu * (1 - target_pi0)
     term1 = delta[1] * (1 - s1_pi0) * s1_mu
     term3 = delta[3] * (1 - s3_pi0) * s3_mu
-    s2_mu = (target_sum_mu - term1 - term3) / (delta[2] * (1 - s2_pi0))
-    s2_mu = max(s2_mu, 2.0)
+    s2_mu = (target_active_spend - term1 - term3) / (delta[2] * (1 - s2_pi0))
+    s2_mu = max(s2_mu, 5.0)
     
-    return delta, [s1_pi0, s2_pi0, s3_pi0], [s1_mu, s2_mu, s3_mu]
+    return delta, [1.0, s1_pi0, s2_pi0, s3_pi0], [0.0, s1_mu, s2_mu, s3_mu]
 
 # =============================================================================
-# 2. PANEL GENERATOR
+# 3. PANEL GENERATOR WITH CUSTOMER HETEROGENEITY
 # =============================================================================
 def generate_principled_panel(
-    n_customers=500,
-    n_periods=100,
-    target_pi0=0.75,
-    target_mu=45.0,
-    target_cv=2.0,
-    separation=0.8,
-    seed=42,
-    burn_in=5
+    n_customers: int = 500,
+    n_periods: int = 100,
+    world: str = 'clumpy',
+    separation: float = 0.8,
+    seed: int = 42,
+    burn_in: int = 5,
+    customer_heterogeneity: float = 2.0
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Generate synthetic RFM panel with behavioral states.
+    Generate synthetic RFM panel with 4-state HMM (Dead + 3 Active).
     
-    Returns:
-        df: Long-format DataFrame with columns [customer_id, time_period, y, state, recency, frequency, monetary]
-        meta: Dictionary with ground truth parameters
+    Args:
+        customer_heterogeneity: Std dev of customer-specific activation shift
     """
     np.random.seed(seed)
     N, T = n_customers, n_periods
-    K = 3  # Cold, Transitional, Hot
-
-    # Transition matrix (4 states: Dead, Cold, Transitional, Hot)
-    Gamma_base = np.array([
-        [0.90, 0.07, 0.02, 0.01],  # From Dead
-        [0.10, 0.80, 0.08, 0.02],  # From Cold
-        [0.05, 0.10, 0.80, 0.05],  # From Transitional
-        [0.02, 0.03, 0.10, 0.85]   # From Hot
+    
+    # Load world preset
+    if world not in WORLD_PRESETS:
+        raise ValueError(f"Unknown world: {world}. Choose from {list(WORLD_PRESETS.keys())}")
+    
+    preset = WORLD_PRESETS[world]
+    target_pi0 = preset['target_pi0']
+    target_mu = preset['target_mu']
+    target_cv = preset['target_cv']
+    anchors = preset['anchors']
+    
+    # State-dependent transition matrix (4 states)
+    # Cold leaks more, Hot is stickier
+    Gamma = np.array([
+        [0.92, 0.06, 0.015, 0.005],  # Dead: hard to reactivate
+        [0.12, 0.78, 0.08,  0.02],   # Cold: leaky
+        [0.05, 0.10, 0.80,  0.05],   # Warm: balanced
+        [0.02, 0.03, 0.08,  0.87]    # Hot: sticky
     ])
-
-    # Anchor points for extreme states (Cold and Hot)
-    anchors = {'s1': (0.95, 5.0), 's3': (0.15, 150.0)}
-    delta, pi_ks, mu_ks = solve_stationary_moments(Gamma_base, target_mu, target_pi0, anchors, separation)
-
-    # State-specific CV → Gamma parameters
-    cv_ks = [1.0, 1.5, target_cv * 1.5]
-    gamma_shapes = [1.0 / (cv**2) for cv in cv_ks]
-    gamma_scales = [mu / shape for mu, shape in zip(mu_ks, gamma_shapes)]
-
-    # Customer-specific activation timing (logistic curve with random shift)
-    time_norm = np.linspace(-8, 4, T - burn_in)
+    
+    # Solve for stationary moments
+    delta, pi_ks, mu_ks = solve_stationary_moments(Gamma, target_mu, target_pi0, anchors, separation)
+    
+    # State-specific CVs: Cold=stable, Hot=variable
+    cv_ks = [0.0, 0.8, target_cv * 0.8, target_cv * 1.2]
+    gamma_shapes = [1.0, 1.0/(cv_ks[1]**2), 1.0/(cv_ks[2]**2), 1.0/(cv_ks[3]**2)]
+    gamma_scales = [0.0, mu_ks[1]/gamma_shapes[1], mu_ks[2]/gamma_shapes[2], mu_ks[3]/gamma_shapes[3]]
+    
+    # Customer-specific activation curves (heterogeneity)
+    time_norm = np.linspace(-6, 4, T)
     base_vibe = 1 / (1 + np.exp(-time_norm))
-    customer_shift = np.random.normal(0, 2, N)
-    p_activate = np.clip(base_vibe[None, :] + customer_shift[:, None] * 0.1, 0, 1)
-
+    customer_shifts = np.random.normal(0, customer_heterogeneity, N)
+    
     # Initialize
     obs = np.zeros((N, T))
     states = np.zeros((N, T), dtype=int)
     recency = np.full((N, T), 999)
-
-    # Burn-in: all start dead
+    
+    # Proper burn-in: all start dead
     states[:, :burn_in] = 0
     recency[:, :burn_in] = 999
-
-    # Simulate dynamics
+    
+    # Simulate with burn-in handling
     for t in range(burn_in, T):
         for i in range(N):
-            curr = states[i, t-1]
-            # Activation from dead
-            if curr == 0 and np.random.rand() < p_activate[i, t-burn_in]:
-                states[i, t] = 1
+            prev_state = states[i, t-1]
+            
+            # Activation from dead with customer-specific timing
+            if prev_state == 0:
+                p_activate = base_vibe[t] + customer_shifts[i] * 0.05
+                p_activate = np.clip(p_activate, 0.001, 0.5)
+                if np.random.rand() < p_activate:
+                    states[i, t] = 1  # Activate to Cold
+                else:
+                    states[i, t] = 0
             else:
-                states[i, t] = np.random.choice(4, p=Gamma_base[curr])
-
-            # Emission (only in non-dead states)
+                # Regular transition
+                states[i, t] = np.random.choice(4, p=Gamma[prev_state])
+            
+            # Emission
             s = states[i, t]
-            if s > 0:
-                cliff_effect = expit(-(recency[i, t] - 10) * 0.6)
-                prob_spend = (1 - pi_ks[s-1]) * cliff_effect
+            if s > 0:  # Non-dead states
+                # Recency cliff: harder to spend if long absence
+                cliff_effect = expit(-(recency[i, t-1] - 8) * 0.5) if t > 0 else 1.0
+                prob_spend = (1 - pi_ks[s]) * cliff_effect
+                
                 if np.random.rand() < prob_spend:
-                    obs[i, t] = np.random.gamma(gamma_shapes[s-1], gamma_scales[s-1])
-
+                    obs[i, t] = np.random.gamma(gamma_shapes[s], gamma_scales[s])
+            
             # Update recency
-            if t < T-1:
-                recency[i, t+1] = 0 if obs[i, t] > 0 else recency[i, t] + 1
-
+            if obs[i, t] > 0:
+                recency[i, t] = 0
+            elif t > 0:
+                recency[i, t] = recency[i, t-1] + 1
+    
     # Build RFM covariates
     r_weeks = recency.copy()
     f_run = np.zeros((N, T))
     m_run = np.zeros((N, T))
-
+    
     for i in range(N):
         cum_count = cum_spend = 0.0
         for t in range(T):
-            spend = obs[i, t]
-            if spend > 0:
+            if obs[i, t] > 0:
                 cum_count += 1
-                cum_spend += spend
+                cum_spend += obs[i, t]
             f_run[i, t] = cum_count
             m_run[i, t] = cum_spend / cum_count if cum_count > 0 else 0.0
-
+    
     # Build long-format DataFrame
     data_list = []
     for i in range(N):
@@ -158,16 +212,18 @@ def generate_principled_panel(
             })
     
     df = pd.DataFrame(data_list)
-
+    
     # Compute actual moments
     actual_pi0 = np.mean(obs == 0)
     active_obs = obs[obs > 0]
     actual_mu = np.mean(active_obs) if len(active_obs) > 0 else 0.0
     actual_cv = np.std(active_obs) / actual_mu if actual_mu > 0 else 0.0
-
+    
     meta = {
         'N': N,
         'T': T,
+        'world': world,
+        'world_desc': preset['desc'],
         'seed': seed,
         'target_pi0': target_pi0,
         'target_mu': target_mu,
@@ -175,19 +231,21 @@ def generate_principled_panel(
         'actual_pi0': actual_pi0,
         'actual_mu': actual_mu,
         'actual_cv': actual_cv,
+        'separation': separation,
+        'customer_heterogeneity': customer_heterogeneity,
         'zero_probs': pi_ks,
         'mu_ks': mu_ks,
         'gamma_shapes': gamma_shapes,
         'gamma_scales': gamma_scales,
         'delta_stationary': delta,
-        'Gamma_base': Gamma_base,
-        'DGP_type': 'Principled_Mixture'
+        'Gamma': Gamma,
+        'DGP_type': 'Principled_4State_HMM'
     }
-
+    
     return df, meta
 
 # =============================================================================
-# 3. OUTPUT FUNCTIONS
+# 4. OUTPUT FUNCTIONS
 # =============================================================================
 def save_simulation_csv(df: pd.DataFrame, output_path: str, include_state: bool = True):
     """Save simulation to CSV format."""
@@ -208,109 +266,151 @@ def save_simulation_pkl(df: pd.DataFrame, meta: Dict, output_path: str):
     print(f"Saved PKL: {output_path}")
 
 # =============================================================================
-# 4. DIAGNOSTIC VISUALIZATION
+# 5. DIAGNOSTIC VISUALIZATIONS
 # =============================================================================
 def run_diagnostics(df: pd.DataFrame, meta: Dict, output_dir: str):
-    """Generate diagnostic plots."""
+    """Generate diagnostic plots including ground truth recovery."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid")
-
-    # Recency Cliff
+    
+    world = meta.get('world', 'unknown')
+    
+    # 1. State distribution over time
+    plt.figure(figsize=(10, 5))
+    state_props = df.groupby('time_period')['true_state'].value_counts(normalize=True).unstack(fill_value=0)
+    state_props.plot(kind='area', stacked=True, alpha=0.7, 
+                     color=['#d62728', '#ff7f0e', '#2ca02c', '#1f77b4'])
+    plt.title(f"State Distribution Over Time ({world})")
+    plt.xlabel("Time Period")
+    plt.ylabel("Proportion")
+    plt.legend(['Dead', 'Cold', 'Warm', 'Hot'], loc='upper right')
+    plt.savefig(output_dir / "state_dynamics.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Recency Cliff
     plt.figure(figsize=(8, 5))
     df_active = df[df['true_state'] > 0].copy()
     df_active['is_spend'] = (df_active['y'] > 0).astype(int)
-    sns.lineplot(data=df_active, x='recency', y='is_spend', err_style="bars")
-    plt.title("Recency Cliff (Behavioral Non-linearity)")
+    recency_cliff = df_active.groupby('recency')['is_spend'].mean().reset_index()
+    recency_cliff = recency_cliff[recency_cliff['recency'] <= 20]
+    sns.lineplot(data=recency_cliff, x='recency', y='is_spend', marker='o')
+    plt.title(f"Recency Cliff ({world})")
     plt.ylabel("P(Spend)")
+    plt.xlabel("Weeks Since Last Purchase")
     plt.savefig(output_dir / "recency_cliff.png", dpi=150, bbox_inches='tight')
     plt.close()
-
-    # State-Wise Intensity
-    plt.figure(figsize=(8, 5))
+    
+    # 3. State-wise spend distribution
+    plt.figure(figsize=(10, 6))
     df_spend = df[df['y'] > 0]
     if len(df_spend) > 0:
-        sns.boxplot(data=df_spend, x='true_state', y='y', palette="Set2")
+        state_labels = {0: 'Dead', 1: 'Cold', 2: 'Warm', 3: 'Hot'}
+        df_spend['state_label'] = df_spend['true_state'].map(state_labels)
+        sns.boxplot(data=df_spend, x='state_label', y='y', 
+                   order=['Cold', 'Warm', 'Hot'], palette="Set2")
         plt.yscale('log')
-        plt.title("State-Wise Spending Intensity (Log Scale)")
-        plt.savefig(output_dir / "state_intensity.png", dpi=150, bbox_inches='tight')
+        plt.title(f"Spend Distribution by State ({world})")
+        plt.ylabel("Spend ($, log scale)")
+        plt.savefig(output_dir / "state_spend_dist.png", dpi=150, bbox_inches='tight')
         plt.close()
-
-    # Transition Matrix Heatmap
-    plt.figure(figsize=(6, 5))
-    Gamma = meta['Gamma_base']
-    sns.heatmap(Gamma, annot=True, fmt='.2f', cmap="YlGnBu",
-                xticklabels=['Dead', 'Cold', 'Trans', 'Hot'],
-                yticklabels=['Dead', 'Cold', 'Trans', 'Hot'])
-    plt.title("Ground Truth Transition Matrix")
-    plt.savefig(output_dir / "transitions.png", dpi=150, bbox_inches='tight')
+    
+    # 4. Transition matrix heatmap
+    plt.figure(figsize=(7, 6))
+    Gamma = meta['Gamma']
+    sns.heatmap(Gamma, annot=True, fmt='.3f', cmap="YlOrRd", vmin=0, vmax=1,
+                xticklabels=['Dead', 'Cold', 'Warm', 'Hot'],
+                yticklabels=['Dead', 'Cold', 'Warm', 'Hot'],
+                cbar_kws={'label': 'Transition Probability'})
+    plt.title(f"True Transition Matrix ({world})")
+    plt.tight_layout()
+    plt.savefig(output_dir / "true_transitions.png", dpi=150, bbox_inches='tight')
     plt.close()
-
-    print(f"Diagnostic plots saved to: {output_dir}")
+    
+    print(f"Diagnostics saved to: {output_dir}")
 
 # =============================================================================
-# 5. MAIN & CLI
+# 6. MAIN & CLI
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Principled synthetic RFM panel generator",
+        description="Principled synthetic RFM panel generator (4-world taxonomy)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--n_customers", type=int, default=500, help="Number of customers")
-    parser.add_argument("--n_periods", type=int, default=100, help="Number of time periods")
-    parser.add_argument("--target_pi0", type=float, default=0.75, help="Target zero-inflation rate")
-    parser.add_argument("--target_mu", type=float, default=45.0, help="Target mean spend (active)")
-    parser.add_argument("--target_cv", type=float, default=2.0, help="Target coefficient of variation")
-    parser.add_argument("--separation", type=float, default=0.8, help="State separation factor")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output", type=str, default="sim_principled", help="Output file prefix")
-    parser.add_argument("--format", type=str, default="both", choices=["csv", "pkl", "both"], 
+    parser.add_argument("--world", type=str, default='clumpy', 
+                       choices=list(WORLD_PRESETS.keys()),
+                       help="Simulation world (2x2 taxonomy cell)")
+    parser.add_argument("--n_customers", type=int, default=300, 
+                       help="Number of customers")
+    parser.add_argument("--n_periods", type=int, default=100, 
+                       help="Number of time periods")
+    parser.add_argument("--separation", type=float, default=0.8, 
+                       help="State separation factor (0-1)")
+    parser.add_argument("--customer_het", type=float, default=2.0, 
+                       help="Customer heterogeneity in activation")
+    parser.add_argument("--seed", type=int, default=42, 
+                       help="Random seed")
+    parser.add_argument("--output", type=str, default=None, 
+                       help="Output file prefix (default: world_name)")
+    parser.add_argument("--format", type=str, default="both", 
+                       choices=["csv", "pkl", "both"], 
                        help="Output format")
-    parser.add_argument("--include_state", action="store_true", default=True, 
-                       help="Include true_state in CSV")
-    parser.add_argument("--plot", action="store_true", help="Generate diagnostic plots")
-    parser.add_argument("--plot_dir", type=str, default=None, help="Plot output directory")
+    parser.add_argument("--no_state", action="store_true", 
+                       help="Exclude true_state from CSV")
+    parser.add_argument("--plot", action="store_true", 
+                       help="Generate diagnostic plots")
+    parser.add_argument("--plot_dir", type=str, default=None, 
+                       help="Plot output directory")
     
     args = parser.parse_args()
-
+    
+    # Set default output name
+    if args.output is None:
+        args.output = f"sim_{args.world}_N{args.n_customers}_T{args.n_periods}_seed{args.seed}"
+    
     print("="*70)
     print("PRINCIPLED SIMULATION GENERATOR")
     print("="*70)
+    print(f"World: {args.world} — {WORLD_PRESETS[args.world]['desc']}")
     print(f"Parameters: N={args.n_customers}, T={args.n_periods}, seed={args.seed}")
-    print(f"Targets: π₀={args.target_pi0:.2%}, μ=${args.target_mu:.1f}, CV={args.target_cv:.2f}")
-
+    
+    preset = WORLD_PRESETS[args.world]
+    print(f"Targets: π₀={preset['target_pi0']:.1%}, μ=${preset['target_mu']:.1f}, CV={preset['target_cv']:.1f}")
+    
     # Generate
     df, meta = generate_principled_panel(
         n_customers=args.n_customers,
         n_periods=args.n_periods,
-        target_pi0=args.target_pi0,
-        target_mu=args.target_mu,
-        target_cv=args.target_cv,
+        world=args.world,
         separation=args.separation,
-        seed=args.seed
+        seed=args.seed,
+        customer_heterogeneity=args.customer_het
     )
-
+    
     print("\n" + "-"*70)
     print("ACTUAL MOMENTS")
     print("-"*70)
-    print(f"Zero rate: {meta['actual_pi0']:.2%} (target: {args.target_pi0:.2%})")
-    print(f"Mean spend: ${meta['actual_mu']:.2f} (target: ${args.target_mu:.1f})")
-    print(f"CV: {meta['actual_cv']:.2f} (target: {args.target_cv:.2f})")
-    print(f"Stationary dist: {meta['delta_stationary'].round(3)}")
-
-    # Save outputs
+    print(f"Zero rate: {meta['actual_pi0']:.2%} (target: {preset['target_pi0']:.1%})")
+    print(f"Mean spend: ${meta['actual_mu']:.2f} (target: ${preset['target_mu']:.1f})")
+    print(f"CV: {meta['actual_cv']:.2f} (target: {preset['target_cv']:.1f})")
+    print(f"Stationary: Dead={meta['delta_stationary'][0]:.3f}, "
+          f"Cold={meta['delta_stationary'][1]:.3f}, "
+          f"Warm={meta['delta_stationary'][2]:.3f}, "
+          f"Hot={meta['delta_stationary'][3]:.3f}")
+    
+    # Save
     print("\n" + "-"*70)
     print("SAVING")
     print("-"*70)
     
     if args.format in ["csv", "both"]:
         csv_path = f"{args.output}.csv"
-        save_simulation_csv(df, csv_path, include_state=args.include_state)
+        save_simulation_csv(df, csv_path, include_state=not args.no_state)
     
     if args.format in ["pkl", "both"]:
         pkl_path = f"{args.output}.pkl"
         save_simulation_pkl(df, meta, pkl_path)
-
+    
     # Plots
     if args.plot:
         print("\n" + "-"*70)
@@ -318,10 +418,12 @@ def main():
         print("-"*70)
         plot_dir = args.plot_dir or f"plots_{args.output}"
         run_diagnostics(df, meta, plot_dir)
-
+    
     print("\n" + "="*70)
     print("COMPLETE")
     print("="*70)
+    print(f"Run harness with:")
+    print(f"  ./launch_harness.sh ./{args.output}.csv ./runs_{args.world}/")
 
 if __name__ == "__main__":
     main()

@@ -281,6 +281,37 @@ def extract_metrics_from_pkl(pkl_path: Path,
 
 ## ----
 
+from sklearn.metrics import adjusted_rand_score
+
+def compute_ari(idata, true_states_csv):
+    """
+    Compute Adjusted Rand Index between Viterbi path and true states.
+    true_states_csv: path to CSV with 'customer_id', 'time_period', 'true_state' columns
+    """
+    # Load true states
+    true_df = pd.read_csv(true_states_csv)
+    
+    # Pivot to (N, T) matrix
+    true_states = true_df.pivot(index='customer_id', columns='time_period', values='true_state').values
+    
+    # Get Viterbi path from idata
+    if 'viterbi' in idata.posterior:
+        viterbi = idata.posterior['viterbi'].mean(dim=['chain', 'draw']).values.astype(int)
+    else:
+        return np.nan
+    
+    # Flatten both (ignore time structure for ARI)
+    true_flat = true_states.flatten()
+    viterbi_flat = viterbi.flatten()
+    
+    # Compute ARI
+    ari = adjusted_rand_score(true_flat, viterbi_flat)
+    
+    return ari
+
+## ----
+
+
 def process_simulation_folder(folder_path: str,
                               ground_truth_csv: Optional[str] = None,
                               metrics: List[str] = ['all'],

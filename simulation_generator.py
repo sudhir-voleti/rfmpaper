@@ -83,14 +83,33 @@ def solve_stationary_moments(Gamma: np.ndarray, target_mu: float, target_pi0: fl
     target_active_spend = target_mu * (1 - target_pi0)
     term1 = delta[1] * (1 - s1_pi0) * s1_mu
     term3 = delta[3] * (1 - s3_pi0) * s3_mu
+
     s2_mu = (target_active_spend - term1 - term3) / (delta[2] * (1 - s2_pi0))
     s2_mu = max(s2_mu, 5.0)
+    
+    # === ORDER CONSTRAINT: Enforce mu_Cold < mu_Warm < mu_Hot ===
+    # Collect active state parameters
+    active_mus = [s1_mu, s2_mu, s3_mu]
+    active_pi0s = [s1_pi0, s2_pi0, s3_pi0]
+    
+    # Sort by mean spend (ascending: Cold < Warm < Hot)
+    order = np.argsort(active_mus)
+    s1_mu, s2_mu, s3_mu = [active_mus[i] for i in order]
+    s1_pi0, s2_pi0, s3_pi0 = [active_pi0s[i] for i in order]
+    
+    # Ensure minimum separation for identifiability
+    min_sep = 2.0
+    if s2_mu - s1_mu < min_sep:
+        s2_mu = s1_mu + min_sep
+    if s3_mu - s2_mu < min_sep:
+        s3_mu = s2_mu + min_sep
     
     return delta, [1.0, s1_pi0, s2_pi0, s3_pi0], [0.0, s1_mu, s2_mu, s3_mu]
 
 # =============================================================================
 # 3. PANEL GENERATOR WITH CUSTOMER HETEROGENEITY
 # =============================================================================
+
 def generate_principled_panel(
     n_customers: int = 500,
     n_periods: int = 100,
@@ -98,29 +117,27 @@ def generate_principled_panel(
     separation: float = 0.8,
     seed: int = 42,
     burn_in: int = 5,
-    customer_heterogeneity: float = 2.0
+    customer_heterogeneity: float = 2.0,
+    target_inflation: float = 1.25,
+    recency_cap: int = 15
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Generate synthetic RFM panel with 4-state HMM (Dead + 3 Active).
-    
-    Args:
-        customer_heterogeneity: Std dev of customer-specific activation shift
+    HYBRID: Stationary init + inflated targets + original activation logic.
     """
     np.random.seed(seed)
     N, T = n_customers, n_periods
     
-    # Load world preset
     if world not in WORLD_PRESETS:
         raise ValueError(f"Unknown world: {world}. Choose from {list(WORLD_PRESETS.keys())}")
     
     preset = WORLD_PRESETS[world]
     target_pi0 = preset['target_pi0']
-    target_mu = preset['target_mu']
-    target_cv = preset['target_cv']
+    inflated_mu = preset['target_mu'] * target_inflation
+    target_cv = preset['target_cv'] * 0.85
     anchors = preset['anchors']
     
-    # State-dependent transition matrix (4 states)
-    # Cold leaks more, Hot is stickier
+    # Transition matrix (4 states: Dead, Cold, Warm, Hot)
     Gamma = np.array([
         [0.92, 0.06, 0.015, 0.005],  # Dead: hard to reactivate
         [0.12, 0.78, 0.08,  0.02],   # Cold: leaky
@@ -129,34 +146,48 @@ def generate_principled_panel(
     ])
     
     # Solve for stationary moments
-    delta, pi_ks, mu_ks = solve_stationary_moments(Gamma, target_mu, target_pi0, anchors, separation)
+    delta, pi_ks, mu_ks = solve_stationary_moments(Gamma, inflated_mu, target_pi0, anchors, separation)
     
-    # State-specific CVs: Cold=stable, Hot=variable
-    cv_ks = [0.0, 0.8, target_cv * 0.8, target_cv * 1.2]
+    # ORDER CONSTRAINT: Enforce mu_Cold < mu_Warm < mu_Hot
+    active_mus = [mu_ks[1], mu_ks[2], mu_ks[3]]
+    active_pi0s = [pi_ks[1], pi_ks[2], pi_ks[3]]
+    order = np.argsort(active_mus)
+    s1_mu, s2_mu, s3_mu = [active_mus[i] for i in order]
+    s1_pi0, s2_pi0, s3_pi0 = [active_pi0s[i] for i in order]
+    mu_ks = [0.0, s1_mu, s2_mu, s3_mu]
+    pi_ks = [1.0, s1_pi0, s2_pi0, s3_pi0]
+    
+    # State-specific CVs
+    cv_ks = [0.0, 0.7, target_cv, target_cv * 1.3]
     gamma_shapes = [1.0, 1.0/(cv_ks[1]**2), 1.0/(cv_ks[2]**2), 1.0/(cv_ks[3]**2)]
     gamma_scales = [0.0, mu_ks[1]/gamma_shapes[1], mu_ks[2]/gamma_shapes[2], mu_ks[3]/gamma_shapes[3]]
     
-    # Customer-specific activation curves (heterogeneity)
+    # Customer-specific activation curves (original logic)
     time_norm = np.linspace(-6, 4, T)
     base_vibe = 1 / (1 + np.exp(-time_norm))
     customer_shifts = np.random.normal(0, customer_heterogeneity, N)
     
-    # Initialize
+    # Initialize matrices
     obs = np.zeros((N, T))
     states = np.zeros((N, T), dtype=int)
-    recency = np.full((N, T), 999)
+    recency = np.zeros((N, T))
     
-    # Proper burn-in: all start dead
-    states[:, :burn_in] = 0
-    recency[:, :burn_in] = 999
+    # Stationary initialization (t=0)
+    states[:, 0] = np.random.choice(4, size=N, p=delta)
+    for i in range(N):
+        if states[i, 0] == 0:
+            recency[i, 0] = 999
+        else:
+            recency[i, 0] = np.random.randint(0, 10)  # Moderate initial recency
     
-    # Simulate with burn-in handling
-    for t in range(burn_in, T):
+    # Simulation loop with burn-in handling
+    for t in range(1, T):
         for i in range(N):
             prev_state = states[i, t-1]
             
-            # Activation from dead with customer-specific timing
+            # State transition
             if prev_state == 0:
+                # Activation from dead with customer-specific timing
                 p_activate = base_vibe[t] + customer_shifts[i] * 0.05
                 p_activate = np.clip(p_activate, 0.001, 0.5)
                 if np.random.rand() < p_activate:
@@ -164,24 +195,27 @@ def generate_principled_panel(
                 else:
                     states[i, t] = 0
             else:
-                # Regular transition
                 states[i, t] = np.random.choice(4, p=Gamma[prev_state])
+            
+            # Update recency BEFORE emission
+            if states[i, t] == 0:
+                recency[i, t] = 999
+            elif prev_state == 0 and states[i, t] > 0:
+                recency[i, t] = 5  # Fresh activation
+            elif obs[i, t-1] > 0:
+                recency[i, t] = 0  # Just purchased
+            else:
+                recency[i, t] = min(recency[i, t-1] + 1, 999)
             
             # Emission
             s = states[i, t]
-            if s > 0:  # Non-dead states
-                # Recency cliff: harder to spend if long absence
-                cliff_effect = expit(-(recency[i, t-1] - 8) * 0.5) if t > 0 else 1.0
+            if s > 0:
+                effective_recency = min(recency[i, t], recency_cap)
+                cliff_effect = expit(-(effective_recency - 8) * 0.6)
                 prob_spend = (1 - pi_ks[s]) * cliff_effect
                 
                 if np.random.rand() < prob_spend:
                     obs[i, t] = np.random.gamma(gamma_shapes[s], gamma_scales[s])
-            
-            # Update recency
-            if obs[i, t] > 0:
-                recency[i, t] = 0
-            elif t > 0:
-                recency[i, t] = recency[i, t-1] + 1
     
     # Build RFM covariates
     r_weeks = recency.copy()
@@ -226,20 +260,22 @@ def generate_principled_panel(
         'world_desc': preset['desc'],
         'seed': seed,
         'target_pi0': target_pi0,
-        'target_mu': target_mu,
-        'target_cv': target_cv,
+        'target_mu': inflated_mu / target_inflation,
+        'target_cv': target_cv / 0.85,
         'actual_pi0': actual_pi0,
         'actual_mu': actual_mu,
         'actual_cv': actual_cv,
         'separation': separation,
         'customer_heterogeneity': customer_heterogeneity,
+        'target_inflation': target_inflation,
+        'recency_cap': recency_cap,
         'zero_probs': pi_ks,
         'mu_ks': mu_ks,
         'gamma_shapes': gamma_shapes,
         'gamma_scales': gamma_scales,
         'delta_stationary': delta,
         'Gamma': Gamma,
-        'DGP_type': 'Principled_4State_HMM'
+        'DGP_type': 'Principled_4State_HMM_Hybrid'
     }
     
     return df, meta

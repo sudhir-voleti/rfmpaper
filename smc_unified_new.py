@@ -6,6 +6,7 @@ Usage:
     python smc_unified_new.py --dataset simulation --K 2 --model_type tweedie --no_gam
 """
 
+
 # =============================================================================
 # 0. APPLE SILICON OPTIMIZATION (MUST BE FIRST)
 # =============================================================================
@@ -102,7 +103,8 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
-    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:    
+    with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
+        # ---- 1. LATENT DYNAMICS ----
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
@@ -110,18 +112,16 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
             pi0 = pm.Dirichlet("pi0", a=np.ones(K, dtype=np.float32))
             Gamma = pm.Dirichlet("Gamma", a=np.ones(K, dtype=np.float32), shape=(K, K))
 
+        # ---- 2. INTERCEPTS & DISPERSION ----
         if K == 1:
-            beta0_raw = pm.Normal("beta0_raw", 0, 1)
-            beta0 = pm.Deterministic("beta0", beta0_raw)
-            phi_raw = pm.Exponential("phi_raw", lam=10.0)
-            phi = pm.Deterministic("phi", phi_raw)
+            beta0 = pm.Normal("beta0", 0, 1)
+            phi = pm.TruncatedNormal("phi", mu=2.0, sigma=1.0, lower=0.5)
         else:
             beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
             beta0 = pm.Deterministic("beta0", pt.sort(beta0_raw))
-            phi_raw = pm.Exponential("phi_raw", lam=10.0, shape=K)
-            #phi = pm.Deterministic("phi", pt.sort(phi_raw))
-            phi = pm.Deterministic("phi", phi_raw) # Don't force sorting here
+            phi = pm.TruncatedNormal("phi", mu=2.0, sigma=1.0, lower=0.5, shape=K)
 
+        # ---- 3. SLOPES / BASIS WEIGHTS (The w_R Fix) ----
         if use_gam:
             if K == 1:
                 w_R = pm.Normal("w_R", 0, 1, shape=n_basis_R)
@@ -141,96 +141,91 @@ def make_model(data, K=3, state_specific_p=True, p_fixed=1.5, use_gam=True, gam_
                 betaF = pm.Normal("betaF", 0, 1, shape=K)
                 betaM = pm.Normal("betaM", 0, 1, shape=K)
 
+        # ---- 4. POWER PARAMETER P ----
         if K == 1:
             p_raw = pm.Beta("p_raw", alpha=2, beta=2)
-            p = pm.Deterministic("p", 1.1 + p_raw * 0.8)
+            p = pm.Deterministic("p", 1.05 + p_raw * 0.9) 
         elif state_specific_p:
             p_raw = pm.Beta("p_raw", alpha=2, beta=2, shape=K)
             p_sorted = pt.sort(p_raw)
-            p = pm.Deterministic("p", 1.1 + p_sorted * 0.8)
+            p = pm.Deterministic("p", 1.05 + p_sorted * 0.9)
         else:
             p = pt.as_tensor_variable(np.array([p_fixed] * K, dtype=np.float32))
 
+        # ---- 5. MU CALCULATION ----
         if use_gam:
             if K == 1:
-                effect_R = pt.tensordot(basis_R, w_R, axes=([2], [0]))
-                effect_F = pt.tensordot(basis_F, w_F, axes=([2], [0]))
-                effect_M = pt.tensordot(basis_M, w_M, axes=([2], [0]))
-                mu = pt.exp(beta0 + effect_R + effect_F + effect_M)
+                eff_R = pt.tensordot(basis_R, w_R, axes=([2], [0]))
+                eff_F = pt.tensordot(basis_F, w_F, axes=([2], [0]))
+                eff_M = pt.tensordot(basis_M, w_M, axes=([2], [0]))
             else:
-                effect_R = pt.tensordot(basis_R, w_R, axes=([2], [1]))
-                effect_F = pt.tensordot(basis_F, w_F, axes=([2], [1]))
-                effect_M = pt.tensordot(basis_M, w_M, axes=([2], [1]))
-                mu = pt.exp(beta0 + effect_R + effect_F + effect_M)
+                eff_R = pt.tensordot(basis_R, w_R, axes=([2], [1]))
+                eff_F = pt.tensordot(basis_F, w_F, axes=([2], [1]))
+                eff_M = pt.tensordot(basis_M, w_M, axes=([2], [1]))
+            mu = pt.exp(beta0 + eff_R + eff_F + eff_M)
         else:
             if K == 1:
                 mu = pt.exp(beta0 + betaR * R + betaF * F + betaM * M)
             else:
-                mu = pt.exp(beta0 + betaR * R[..., None] + betaF * F[..., None] + betaM * M[..., None])
+                mu = pt.exp(beta0 + betaR * R[..., None] + 
+                            betaF * F[..., None] + betaM * M[..., None])
 
         mu = pt.clip(mu, 1e-3, 1e6)
 
-        # --- 1. PARAMETER EXPANSION & STABLE EMISSION ---
+        # ---- 6. PARAMETER EXPANSION & STABLE EMISSION ----
         if K == 1:
-            p_exp = p
-            phi_exp = phi
-            y_input = y
-            mask_input = mask
+            p_exp, phi_exp = p, phi
+            y_in, mask_in = y, mask
         else:
-            p_exp = p[None, None, :]
-            phi_exp = phi[None, None, :]
-            y_input = y[..., None]
-            mask_input = mask[:, :, None]
+            p_exp, phi_exp = p[None, None, :], phi[None, None, :]
+            y_in, mask_in = y[..., None], mask[:, :, None]
 
         exponent = 2.0 - p_exp
-        
-        # Stable log-space calculation for Tweedie zero-mass
-        # log_psi = - (mu^(2-p)) / (phi * (2-p))
         log_psi = -(pt.pow(mu, exponent) / (phi_exp * exponent))
-        log_psi = pt.clip(log_psi, -100, -1e-12) # Prevents inf and stabilizes log_pos
+        log_psi = pt.clip(log_psi, -100, -1e-12)
         
         log_zero = log_psi
-        # Stable log(1 - exp(x)) using log(-expm1(x))
-        log_pos = pt.log(-pt.expm1(log_psi)) + gamma_logp_det(y_input, mu, phi_exp)
+        log_pos = pt.log(-pt.expm1(log_psi)) + gamma_logp_det(y_in, mu, phi_exp)
         
-        log_emission = pt.where(y_input == 0, log_zero, log_pos)
-        log_emission = pt.where(mask_input, log_emission, 0.0) 
+        log_emission = pt.where(y_in == 0, log_zero, log_pos)
+        log_emission = pt.where(mask_in, log_emission, 0.0) 
 
-
-        # --- 2. FORWARD ALGORITHM (HMM INTEGRATION) ---
+        # ---- 7. FORWARD ALGORITHM (HMM INTEGRATION) ----
         if K == 1:
             logp_cust = pt.sum(log_emission, axis=1)
-            # Placeholder for K=1 consistency
-            alpha_filtered = pt.ones((N, T, 1))
+            # Create a placeholder to avoid UnboundLocalError in Deterministics
+            alpha_filtered_val = pt.ones((N, T, 1))
         else:
-            # Initialize: P(S_0 | y_0)
             log_alpha = pt.log(pi0) + log_emission[:, 0, :]
+            log_norm_0 = pt.logsumexp(log_alpha, axis=1, keepdims=True)
+            log_alpha_norm = log_alpha - log_norm_0
+            
+            alpha_seq = [log_alpha_norm]
             log_Gamma = pt.log(Gamma)[None, :, :]
+            log_cumulant = log_norm_0  
             
-            alpha_seq = [log_alpha]
-            
-            # Recursive pass
             for t in range(1, T):
-                # temp = log P(S_{t-1} | y_{0:t-1}) + log P(S_t | S_{t-1})
-                temp = log_alpha[:, :, None] + log_Gamma
-                # log_alpha = log P(y_t | S_t) + log sum(temp)
-                log_alpha = log_emission[:, t, :] + pt.logsumexp(temp, axis=1)
-                alpha_seq.append(log_alpha)
+                temp = log_alpha_norm[:, :, None] + log_Gamma
+                curr_em = pt.clip(log_emission[:, t, :], -1e6, 100.0)
+                log_alpha = curr_em + pt.logsumexp(temp, axis=1)
+                
+                log_norm_t = pt.logsumexp(log_alpha, axis=1, keepdims=True)
+                log_alpha_norm = log_alpha - log_norm_t
+                
+                alpha_seq.append(log_alpha_norm)
+                log_cumulant = log_cumulant + log_norm_t  
             
-            # Stack and Normalize to get P(S_t | y_{0:t})
             log_alpha_stacked = pt.stack(alpha_seq, axis=1)
-            alpha_filtered = pt.exp(log_alpha_stacked - pt.logsumexp(log_alpha_stacked, axis=2, keepdims=True))
-            
-            # Total log-likelihood for the customer is the logsumexp of the final alpha
-            logp_cust = pt.logsumexp(log_alpha, axis=1)
+            alpha_filtered_val = pt.exp(log_alpha_stacked) 
+            logp_cust = pt.squeeze(log_cumulant, axis=1)
 
-        # --- 3. DETERMINISTICS & POTENTIAL ---
+        # ---- 8. DETERMINISTICS & POTENTIAL ----
         if K > 1:
-            pm.Deterministic('alpha_filtered', alpha_filtered, dims=('customer', 'time', 'state'))
+            pm.Deterministic('alpha_filtered', alpha_filtered_val, dims=('customer', 'time', 'state'))
+            pm.Deterministic('max_log_alpha', pt.max(pt.stack(alpha_seq)))
 
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
-
 
 
         # --- VITERBI BACKTRACK (MOST LIKELY STATE PATH) ---
@@ -310,90 +305,74 @@ def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
         n_basis_R = n_basis_F = n_basis_M = 1
         basis_R = basis_F = basis_M = None
 
+
     with pm.Model(coords={"customer": np.arange(N), "time": np.arange(T), "state": np.arange(K)}) as model:
+        # ---- 1. LATENT DYNAMICS (pi0 and Gamma) ----
         if K == 1:
             pi0 = pt.as_tensor_variable(np.array([1.0], dtype=np.float32))
             Gamma = pt.as_tensor_variable(np.array([[1.0]], dtype=np.float32))
         else:
             pi0 = pm.Dirichlet("pi0", a=np.ones(K, dtype=np.float32))
+            # Concentration prior for persistence (diagonal)
             Gamma = pm.Dirichlet("Gamma", a=np.ones(K, dtype=np.float32), shape=(K, K))
 
-        if K == 1:
-            alpha0 = pm.Normal("alpha0", 0, 1)
-            if use_gam:
-                w_R_h = pm.Normal("w_R_h", 0, 1, shape=n_basis_R)
-                w_F_h = pm.Normal("w_F_h", 0, 1, shape=n_basis_F)
-                w_M_h = pm.Normal("w_M_h", 0, 1, shape=n_basis_M)
-            else:
-                alphaR = pm.Normal("alphaR", 0, 1)
-                alphaF = pm.Normal("alphaF", 0, 1)
-                alphaM = pm.Normal("alphaM", 0, 1)
-        else:
-            alpha0 = pm.Normal("alpha0", 0, 1, shape=K)
-            if use_gam:
-                w_R_h = pm.Normal("w_R_h", 0, 1, shape=(K, n_basis_R))
-                w_F_h = pm.Normal("w_F_h", 0, 1, shape=(K, n_basis_F))
-                w_M_h = pm.Normal("w_M_h", 0, 1, shape=(K, n_basis_M))
-            else:
-                alphaR = pm.Normal("alphaR", 0, 1, shape=K)
-                alphaF = pm.Normal("alphaF", 0, 1, shape=K)
-                alphaM = pm.Normal("alphaM", 0, 1, shape=K)
-
-        if K == 1:
-            beta0 = pm.Normal("beta0", 0, 1)
-            phi = pm.Exponential("phi", lam=10.0)
-            if use_gam:
-                w_R = pm.Normal("w_R", 0, 1, shape=n_basis_R)
-                w_F = pm.Normal("w_F", 0, 1, shape=n_basis_F)
-                w_M = pm.Normal("w_M", 0, 1, shape=n_basis_M)
-            else:
-                betaR = pm.Normal("betaR", 0, 1)
-                betaF = pm.Normal("betaF", 0, 1)
-                betaM = pm.Normal("betaM", 0, 1)
-        else:
-            beta0 = pm.Normal("beta0", 0, 1, shape=K)
-            phi = pm.Exponential("phi", lam=10.0, shape=K)
-            if use_gam:
-                w_R = pm.Normal("w_R", 0, 1, shape=(K, n_basis_R))
-                w_F = pm.Normal("w_F", 0, 1, shape=(K, n_basis_F))
-                w_M = pm.Normal("w_M", 0, 1, shape=(K, n_basis_M))
-            else:
-                betaR = pm.Normal("betaR", 0, 1, shape=K)
-                betaF = pm.Normal("betaF", 0, 1, shape=K)
-                betaM = pm.Normal("betaM", 0, 1, shape=K)
-
+        # ---- 2. HURDLE PARAMETERS (Zero-Part: alpha) ----
+        # Only needed if using Hurdle/ZIG. If running pure Tweedie, these can be ignored.
+        alpha0 = pm.Normal("alpha0", 0, 1, shape=K if K > 1 else None)
+        
         if use_gam:
+            w_R_h = pm.Normal("w_R_h", 0, 1, shape=(K, n_basis_R) if K > 1 else n_basis_R)
+            w_F_h = pm.Normal("w_F_h", 0, 1, shape=(K, n_basis_F) if K > 1 else n_basis_F)
+            w_M_h = pm.Normal("w_M_h", 0, 1, shape=(K, n_basis_M) if K > 1 else n_basis_M)
+            
+            # logit_p calculation
             if K == 1:
-                effect_R_h = pt.tensordot(basis_R, w_R_h, axes=([2], [0]))
-                effect_F_h = pt.tensordot(basis_F, w_F_h, axes=([2], [0]))
-                effect_M_h = pt.tensordot(basis_M, w_M_h, axes=([2], [0]))
-                logit_p_pos = alpha0 + effect_R_h + effect_F_h + effect_M_h
+                logit_p_pos = alpha0 + pt.tensordot(basis_R, w_R_h, axes=([2], [0])) + \
+                              pt.tensordot(basis_F, w_F_h, axes=([2], [0])) + \
+                              pt.tensordot(basis_M, w_M_h, axes=([2], [0]))
             else:
-                effect_R_h = pt.tensordot(basis_R, w_R_h, axes=([2], [1]))
-                effect_F_h = pt.tensordot(basis_F, w_F_h, axes=([2], [1]))
-                effect_M_h = pt.tensordot(basis_M, w_M_h, axes=([2], [1]))
-                logit_p_pos = alpha0 + effect_R_h + effect_F_h + effect_M_h
+                logit_p_pos = alpha0 + pt.tensordot(basis_R, w_R_h, axes=([2], [1])) + \
+                              pt.tensordot(basis_F, w_F_h, axes=([2], [1])) + \
+                              pt.tensordot(basis_M, w_M_h, axes=([2], [1]))
         else:
+            alphaR = pm.Normal("alphaR", 0, 1, shape=K if K > 1 else None)
+            alphaF = pm.Normal("alphaF", 0, 1, shape=K if K > 1 else None)
+            alphaM = pm.Normal("alphaM", 0, 1, shape=K if K > 1 else None)
+            
             if K == 1:
                 logit_p_pos = alpha0 + alphaR * R + alphaF * F + alphaM * M
             else:
                 logit_p_pos = alpha0 + alphaR * R[..., None] + alphaF * F[..., None] + alphaM * M[..., None]
 
-        p_pos = pt.sigmoid(logit_p_pos)
-        p_pos = pt.clip(p_pos, 1e-6, 1 - 1e-6)
+        p_pos = pt.clip(pt.sigmoid(logit_p_pos), 1e-6, 1 - 1e-6)
+
+        # ---- 3. SPENDING PARAMETERS (Mean-Part: beta) ----
+        if K == 1:
+            beta0 = pm.Normal("beta0", 0, 1)
+            phi = pm.TruncatedNormal("phi", mu=2.0, sigma=1.0, lower=0.5)
+        else:
+            beta0_raw = pm.Normal("beta0_raw", 0, 1, shape=K)
+            beta0 = pm.Deterministic("beta0", pt.sort(beta0_raw))
+            phi = pm.TruncatedNormal("phi", mu=2.0, sigma=1.0, lower=0.5)
 
         if use_gam:
+            w_R = pm.Normal("w_R", 0, 1, shape=(K, n_basis_R) if K > 1 else n_basis_R)
+            w_F = pm.Normal("w_F", 0, 1, shape=(K, n_basis_F) if K > 1 else n_basis_F)
+            w_M = pm.Normal("w_M", 0, 1, shape=(K, n_basis_M) if K > 1 else n_basis_M)
+            
             if K == 1:
-                effect_R = pt.tensordot(basis_R, w_R, axes=([2], [0]))
-                effect_F = pt.tensordot(basis_F, w_F, axes=([2], [0]))
-                effect_M = pt.tensordot(basis_M, w_M, axes=([2], [0]))
-                mu = pt.exp(beta0 + effect_R + effect_F + effect_M)
+                mu = pt.exp(beta0 + pt.tensordot(basis_R, w_R, axes=([2], [0])) + \
+                            pt.tensordot(basis_F, w_F, axes=([2], [0])) + \
+                            pt.tensordot(basis_M, w_M, axes=([2], [0])))
             else:
-                effect_R = pt.tensordot(basis_R, w_R, axes=([2], [1]))
-                effect_F = pt.tensordot(basis_F, w_F, axes=([2], [1]))
-                effect_M = pt.tensordot(basis_M, w_M, axes=([2], [1]))
-                mu = pt.exp(beta0 + effect_R + effect_F + effect_M)
+                mu = pt.exp(beta0 + pt.tensordot(basis_R, w_R, axes=([2], [1])) + \
+                            pt.tensordot(basis_F, w_F, axes=([2], [1])) + \
+                            pt.tensordot(basis_M, w_M, axes=([2], [1])))
         else:
+            betaR = pm.Normal("betaR", 0, 1, shape=K if K > 1 else None)
+            betaF = pm.Normal("betaF", 0, 1, shape=K if K > 1 else None)
+            betaM = pm.Normal("betaM", 0, 1, shape=K if K > 1 else None)
+            
             if K == 1:
                 mu = pt.exp(beta0 + betaR * R + betaF * F + betaM * M)
             else:
@@ -401,24 +380,23 @@ def make_hurdle_model(data, K=3, use_gam=True, gam_df=3):
 
         mu = pt.clip(mu, 1e-3, 1e6)
 
+        # ---- 4. EMISSION LIKELIHOOD ----
         if K == 1:
             log_zero = pt.log(1 - p_pos)
             log_pos = pt.log(p_pos) + gamma_logp_det(y, mu, phi)
             log_emission = pt.where(y == 0, log_zero, log_pos)
             log_emission = pt.where(mask, log_emission, 0.0)
+            logp_cust = pt.sum(log_emission, axis=1)
         else:
             p_pos_exp = p_pos[..., None]
             mu_exp = mu[..., None]
             phi_exp = phi[None, None, :]
             log_zero = pt.log(1 - p_pos_exp)
-            y_exp = y[..., None]
-            log_pos = pt.log(p_pos_exp) + gamma_logp_det(y_exp, mu_exp, phi_exp)
-            log_emission = pt.where(y_exp == 0, log_zero, log_pos)
+            log_pos = pt.log(p_pos_exp) + gamma_logp_det(y[..., None], mu_exp, phi_exp)
+            log_emission = pt.where(y[..., None] == 0, log_zero, log_pos)
             log_emission = pt.where(mask[:, :, None], log_emission, 0.0)
 
-        if K == 1:
-            logp_cust = pt.sum(log_emission, axis=1)
-        else:
+            # Forward Algorithm for HMM
             log_alpha = pt.log(pi0) + log_emission[:, 0, :]
             log_Gamma = pt.log(Gamma)[None, :, :]
             for t in range(1, T):
@@ -670,7 +648,7 @@ def make_nbd_model(data, K=3, use_gam=True, gam_df=3):
         pm.Potential('loglike', pt.sum(logp_cust))
         pm.Deterministic('log_likelihood', logp_cust, dims=('customer',))
 
-    return model
+        return model
 
 # =============================================================================
 # 4. DATA BUILDER
@@ -762,6 +740,14 @@ def load_simulation_data(data_path, n_cust=None, seed=42, train_frac=1.0):
     # Compute RFM on training data only
     R_train, F_train, M_train = compute_rfm_features(obs_train, mask_train)
     
+    # ADD THIS IMMEDIATELY AFTER:
+    # Log-transform and Z-scale Monetary to prevent gradient explosion
+    M_train = np.log1p(M_train) 
+    # Optional: Z-scale all for maximum stability
+    R_train = (R_train - np.mean(R_train)) / (np.std(R_train) + 1e-6)
+    F_train = (F_train - np.mean(F_train)) / (np.std(F_train) + 1e-6)
+    M_train = (M_train - np.mean(M_train)) / (np.std(M_train) + 1e-6)
+
     data = {
         'N': N,
         'T': T_train,
@@ -816,14 +802,142 @@ def build_panel_data(df_path, customer_col='customer_id', n_cust=None, seed=RAND
         'p0': mat('p0_cust')
     }
 
+
+## ----
+
+
+def compute_oos_prediction(data, idata, model_type, use_gam, gam_df):
+    """
+    Refined OOS prediction with stabilized tensor alignment and tuple returns.
+    """
+    import numpy as np
+    from patsy import dmatrix
+
+    try:
+        # 1. Setup
+        if 'y_test' not in data or idata is None:
+            return np.nan, np.nan
+            
+        y_test = data['y_test']
+        T_test = data['T_test']
+        N = data['N']
+        y_train = data['y']
+        
+        # Point estimates for OOS efficiency
+        post = idata.posterior.mean(dim=['chain', 'draw'])
+        beta0 = post['beta0'].values
+        K = beta0.shape[0] if beta0.ndim > 0 else 1
+
+        # 2. RFM Carry-over
+        mask_test = np.ones((N, T_test), dtype=bool)
+        R_test, F_test, M_test = compute_rfm_features_oos(y_train, y_test, mask_test)
+
+        # 3. Model Logic
+        if use_gam:
+            def get_basis_oos(x_train, x_test, df, degree=3):
+                x_tr_flat = x_train.flatten()
+                knots = np.quantile(x_tr_flat, np.linspace(0, 1, df - degree + 1)[1:-1]).tolist()
+                formula = f"bs(x, knots={list(knots)}, degree={degree}, include_intercept=False)"
+                basis = dmatrix(formula, {"x": x_test.flatten()}, return_type='matrix')
+                return np.asarray(basis, dtype=np.float32).reshape(N, T_test, -1)
+
+            B_R = get_basis_oos(data['R'], R_test, gam_df)
+            B_F = get_basis_oos(data['F'], F_test, gam_df)
+            B_M = get_basis_oos(data['M'], M_test, gam_df)
+
+            if K == 1:
+                eff_R = np.tensordot(B_R, post['w_R'].values, axes=([2], [0]))
+                eff_F = np.tensordot(B_F, post['w_F'].values, axes=([2], [0]))
+                eff_M = np.tensordot(B_M, post['w_M'].values, axes=([2], [0]))
+                log_mu = beta0 + eff_R + eff_F + eff_M
+            else:
+                # tensordot( (N,T,B), (K,B).T ) -> (N,T,K)
+                w_R, w_F, w_M = post['w_R'].values, post['w_F'].values, post['w_M'].values
+                eff_R = np.tensordot(B_R, w_R, axes=([2], [1]))
+                eff_F = np.tensordot(B_F, w_F, axes=([2], [1]))
+                eff_M = np.tensordot(B_M, w_M, axes=([2], [1]))
+                log_mu = beta0[None, None, :] + eff_R + eff_F + eff_M
+        
+        else: # GLM Logic
+            if 'betaR' not in post: return np.nan, np.nan
+            bR, bF, bM = post['betaR'].values, post['betaF'].values, post['betaM'].values
+            if K == 1:
+                log_mu = beta0 + bR * R_test + bF * F_test + bM * M_test
+            else:
+                log_mu = beta0[None, None, :] + bR[None, None, :] * R_test[..., None] + \
+                         bF[None, None, :] * F_test[..., None] + bM[None, None, :] * M_test[..., None]
+
+        mu_final = np.exp(np.clip(log_mu, -10, 10))
+
+        # 4. HMM Projection
+        if K == 1:
+            y_pred = mu_final
+        else:
+            if 'alpha_filtered' not in post: return np.nan, np.nan
+            state_probs = post['alpha_filtered'].values[:, -1, :] 
+            Gamma = post['Gamma'].values
+            y_pred = np.zeros((N, T_test))
+            for t in range(T_test):
+                state_probs = state_probs @ Gamma
+                y_pred[:, t] = np.sum(state_probs * mu_final[:, t, :], axis=1)
+
+        # 5. Metrics
+        mask = ~np.isnan(y_test)
+        if mask.sum() == 0: return np.nan, np.nan
+        rmse = np.sqrt(np.mean((y_test[mask] - y_pred[mask])**2))
+        mae = np.mean(np.abs(y_test[mask] - y_pred[mask]))
+        return float(rmse), float(mae)
+
+    except Exception as e:
+        print(f"DEBUG: OOS Error: {e}")
+        return np.nan, np.nan
+
+
+## ----
+
+def compute_rfm_features_oos(y_train, y_test, mask_test):
+    """
+    Propagates RFM state from training history into test period.
+    """
+    N, T_test = y_test.shape
+    T_train = y_train.shape[1]
+    R, F, M = np.zeros((N, T_test)), np.zeros((N, T_test)), np.zeros((N, T_test))
+    
+    for i in range(N):
+        # Look back at training history for initial state
+        train_purchase_indices = np.where(y_train[i, :] > 0)[0]
+        if len(train_purchase_indices) > 0:
+            last_p = train_purchase_indices[-1]
+            cum_f = len(train_purchase_indices)
+            cum_m = np.sum(y_train[i, :])
+        else:
+            last_p = -1
+            cum_f = 0
+            cum_m = 0.0
+        
+        for t in range(T_test):
+            t_abs = T_train + t
+            if y_test[i, t] > 0:
+                last_p = t_abs
+                cum_f += 1
+                cum_m += y_test[i, t]
+            
+            R[i, t] = t_abs - last_p if last_p != -1 else t_abs + 1
+            F[i, t] = cum_f
+            M[i, t] = cum_m / cum_f if cum_f > 0 else 0.0
+            
+    return R.astype(np.float32), F.astype(np.float32), M.astype(np.float32)
+
+
+
 # =============================================================================
 # 5. SMC RUNNER
 # =============================================================================
 
 def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
             draws, chains, seed, out_dir):
-    """Run SMC with model_type selection."""
-    
+    """Run SMC with model_type selection and OOS prediction."""
+
     if model_type == 'hurdle':
         model_builder = make_hurdle_model
     elif model_type == 'poisson':
@@ -832,7 +946,7 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
         model_builder = make_nbd_model
     else:
         model_builder = make_model
-    
+
     cores = min(chains, os.cpu_count() or 1)
     t0 = time.time()
 
@@ -841,23 +955,21 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
             with model_builder(data, K=K, use_gam=use_gam, gam_df=gam_df) as model:
                 print(f" Model: K={K}, {model_type.upper()}-{'GAM' if use_gam else 'GLM'}")
                 idata = pm.sample_smc(draws=draws, chains=chains, cores=cores,
-                                     random_seed=seed, return_inferencedata=True, threshold=0.8)
+                                      random_seed=seed, return_inferencedata=True, threshold=0.8)
         else:
-            with model_builder(data, K=K, state_specific_p=state_specific_p, 
-                              p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df) as model:
+            with model_builder(data, K=K, state_specific_p=state_specific_p,
+                               p_fixed=p_fixed, use_gam=use_gam, gam_df=gam_df) as model:
                 print(f" Model: K={K}, {model_type.upper()}-{'GAM' if use_gam else 'GLM'}")
                 idata = pm.sample_smc(draws=draws, chains=chains, cores=cores,
-                                     random_seed=seed, return_inferencedata=True, threshold=0.8)
+                                      random_seed=seed, return_inferencedata=True, threshold=0.8)
 
-            # === ADD THIS BLOCK ===
-            # Add posterior predictive for state recovery
-            if K > 1:
-                try:
-                    pm.sample_posterior_predictive(idata, extend_inferencedata=True, random_seed=seed)
-                except:
-                    pass
-            # === END ADD ===        
-        
+        # Add posterior predictive for state recovery
+        if K > 1:
+            try:
+                pm.sample_posterior_predictive(idata, extend_inferencedata=True, random_seed=seed)
+            except:
+                pass
+
         log_ev = np.nan
         try:
             lm = idata.sample_stats.log_marginal_likelihood.values
@@ -882,14 +994,30 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
         except:
             pass
 
+        # ADD THIS inside the result extraction:
+        if log_ev > 0:
+            print("WARNING: Positive Log-Ev detected. Numerical instability likely.")
+            # log_ev = np.nan # Optional: invalidate the result
+
         elapsed = (time.time() - t0) / 60
 
+        # === OOS PREDICTION ===
+        oos_rmse = np.nan
+        oos_mae = np.nan
+        if 'y_test' in data:
+            try:
+                oos_rmse, oos_mae = compute_oos_prediction(data, idata, model_type, use_gam, gam_df)
+                print(f"  OOS RMSE: {oos_rmse:.4f}, MAE: {oos_mae:.4f}")
+            except Exception as e:
+                print(f"  OOS prediction failed: {str(e)[:50]}")
 
         res = {
             'K': K, 'model_type': model_type, 'N': data['N'], 'T': data['T'],
             'use_gam': use_gam, 'gam_df': gam_df if use_gam else None,
             'log_evidence': log_ev, 'draws': draws, 'chains': chains,
-            'time_min': elapsed, 'timestamp': time.strftime('%Y%m%d_%H%M%S')
+            'time_min': elapsed, 'timestamp': time.strftime('%Y%m%d_%H%M%S'),
+            'oos_rmse': oos_rmse,
+            'oos_mae': oos_mae
         }
 
         # Add test data if available
@@ -910,28 +1038,9 @@ def run_smc(data, K, model_type, state_specific_p, p_fixed, use_gam, gam_df,
     except Exception as e:
         print(f" ✗ CRASH: {str(e)[:60]}")
         raise
-        
-        elapsed = (time.time() - t0) / 60
 
-        res = {
-            'K': K, 'model_type': model_type, 'N': data['N'], 'T': data['T'],
-            'use_gam': use_gam, 'gam_df': gam_df if use_gam else None,
-            'log_evidence': log_ev, 'draws': draws, 'chains': chains,
-            'time_min': elapsed, 'timestamp': time.strftime('%Y%m%d_%H%M%S')
-        }
 
-        p_tag = f"p{p_fixed}" if (model_type == 'tweedie' and not state_specific_p and K > 1) else "statep" if (state_specific_p and K > 1) else "discrete"
-        pkl_path = out_dir / f"smc_K{K}_{model_type.upper()}_{'GAM' if use_gam else 'GLM'}_{p_tag}_N{data['N']}_D{draws}.pkl"
 
-        with open(pkl_path, 'wb') as f:
-            pickle.dump({'idata': idata, 'res': res}, f, protocol=4)
-
-        print(f" ✓ log_ev={log_ev:.2f}, time={elapsed:.1f}min")
-        return pkl_path, res
-
-    except Exception as e:
-        print(f" ✗ CRASH: {str(e)[:60]}")
-        raise
 
 # =============================================================================
 # 6. MAIN
